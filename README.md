@@ -56,6 +56,19 @@ The fork adds:
 | Data | ERA5 via ARCO; train 2009–2018, validation 2019 |
 | Config | `config/rewind_fcn3.yaml`, target `rewind_fcn3_ens_10yr_backward` |
 
+## Companion study
+
+The case studies (the 2021 Pacific Northwest heat dome and Hurricane Ian) and their analysis
+regions follow the companion paper *Extremes on Rewind: Generating 1,000-Member Ensembles
+Initialized at a Final Condition* (Lin, Chien, Sakarvadia and Barnes, 2026,
+[arXiv:2608.19008](https://arxiv.org/abs/2608.19008)), which generates ensembles conditioned on
+a final state with cBottle-video. Its code and case definitions are at
+[jerrylin96/rewinding-the-extremes](https://github.com/jerrylin96/rewinding-the-extremes)
+(archived at [10.5281/zenodo.22000716](https://doi.org/10.5281/zenodo.22000716)). The horizon
+diagnostics here take their per-(case, variable) reduction boxes verbatim from that repository's
+`scripts/_shared/cases/*.yaml`, so the two studies reduce over the same pixels, and report
+geopotential as height in metres by the same convention.
+
 ## Reproducing the pipeline
 
 All launchers are SLURM batch scripts that run inside the container. Set the two paths in
@@ -168,6 +181,21 @@ FourCastNet 3 paper when using this code:
 ```
 
 ## Citation
+
+The companion study:
+
+```bibtex
+@misc{lin2026extremesonrewind,
+      title={Extremes on Rewind: Generating 1,000-Member Ensembles Initialized at a Final Condition},
+      author={Jerry Lin and Mu-Ting Chien and Mansi Sakarvadia and Elizabeth A. Barnes},
+      year={2026},
+      eprint={2608.19008},
+      archivePrefix={arXiv},
+      url={https://arxiv.org/abs/2608.19008},
+}
+```
+
+This paper:
 
 <!-- TODO: replace with the workshop paper's bibtex -->
 ```bibtex

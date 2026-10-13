@@ -90,7 +90,8 @@ ANCHOR_DATE="${5:-2021-06-28T12:00}"
 # shell variable expands to "" and `${6:-...}` treats empty exactly like unset -- so a lost
 # variable falls back to this list with no error, after 250 tasks have run. Making the list we
 # actually want the default means the fallback IS the right answer.
-#   (a) the head-to-head comparison set of the cBottle-video study: u10m, v10m, t2m,
+#   (a) cBottle-video's STORED_VARIABLES in the companion study (Lin et al. 2026, arXiv:2608.19008; github.com/jerrylin96/rewinding-the-extremes),
+#       the head-to-head comparison set: u10m, v10m, t2m,
 #       msl, tcwv, u200, v200, z300, u500, v500, t500, z500, u850, v850. Their `sst` is NOT
 #       here and cannot be: our 72 channels are prognostic atmospheric state, and SST is a
 #       prescribed boundary field (an input, never a target).

@@ -73,8 +73,9 @@ RANGE_DEFAULT = {"t2m": (150.0, 350.0)}
 # display units
 # ---------------------------------------------------------------------------
 # Standard gravity (WMO), m/s^2. The one magic conversion factor in this
-# codebase, and deliberately the SAME one the companion cBottle-video analysis
-# uses, so a geopotential number of ours can be set beside one of theirs.
+# codebase, and deliberately the SAME one the companion study uses (Lin et al. 2026, arXiv:2608.19008; github.com/jerrylin96/rewinding-the-extremes,
+# scripts/_shared/var_metadata.py: DISPLAY_GRAVITY), so a geopotential number of
+# ours can be set beside one of theirs.
 DISPLAY_GRAVITY = 9.80665
 
 _GEOPOTENTIAL_RE = re.compile(r"^z(\d+)?$")
@@ -94,7 +95,7 @@ _STORAGE_UNITS = {
 def is_geopotential(channel):
     """True for geopotential variables (``z``, ``z500``, ``z850``, ...).
 
-    Mirrors the companion analysis's is_geopotential so the two codebases agree on
+    Mirrors the companion study's is_geopotential (rewinding-the-extremes) so the two codebases agree on
     which fields get converted.
     """
     return bool(_GEOPOTENTIAL_RE.match(str(channel)))
@@ -104,7 +105,7 @@ def to_display_units(channel, field, power=1):
     """Scale a raw field into the units ``display_unit`` names.
 
     ERA5 stores geopotential in m^2/s^2; domain scientists read geopotential
-    HEIGHT in m, which is what the companion analysis publishes, so a plot of ours
+    HEIGHT in m, which is what the companion study (arXiv:2608.19008) publishes, so a plot of ours
     beside a plot of theirs should carry the same numbers. Division by standard
     gravity is the only conversion here.
 
@@ -248,7 +249,7 @@ def box_mask(lat, lon, box):
 
     Longitudes are compared modulo 360, so the SAME box argument works whether the dump's
     lon axis runs 0..360 (ARCO/ERA5, ours) or -180..180 (what a reader will type, and what
-    the companion analysis's ``--region -126 -110 38 55`` uses). A box whose wrapped west
+    the companion study's ``--region -126 -110 38 55`` uses). A box whose wrapped west
     exceeds its east crosses the prime meridian and is handled as a union. Latitude is
     compared directly, so a descending ERA5 lat axis needs no special case.
     """

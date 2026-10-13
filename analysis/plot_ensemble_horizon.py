@@ -3,7 +3,8 @@
 # ============================================================================
 """Case-study instability / horizon diagnostics 1-3, from the pooled 1000-member field dumps.
 
-  1. DOMAIN-MEAN SPAGHETTI vs lead -- the companion cBottle-video study's Figure 1 q/r, extended. Every
+  1. DOMAIN-MEAN SPAGHETTI vs lead -- Figure 1 q/r of the companion study (Lin et al. 2026,
+     arXiv:2608.19008; github.com/jerrylin96/rewinding-the-extremes), extended. Every
      member thin, ERA5 dashed, survivor median + IQR, survival fraction underneath, both
      cases on shared axes. Their entire 66 h span is our first 11 steps on the same grid,
      so the panels overlay directly; the only change is an x-axis running to -180 h.
@@ -50,8 +51,9 @@ filename schemes work):
       --out_dir $S/../diagnostics
 
 THE DOMAIN IS A PROPERTY OF THE (CASE, VARIABLE) PAIR, NOT OF THE CASE. Taken verbatim
-from the companion cBottle-video study's own case definitions, so our numbers land on the
-same pixels as theirs. One --channel per run, so pick the row:
+from the companion study's own case definitions (Lin et al. 2026, arXiv:2608.19008; github.com/jerrylin96/rewinding-the-extremes,
+`scripts/_shared/cases/{pnw_heatwave,ian}.yaml`, key `diagnostics.spread_rmse_crps.domains`)
+so our numbers land on the same pixels as theirs. One --channel per run, so pick the row:
 
   case            channel   region     --box / --case_box W,E,S,N     mask
   PNW heat dome   t2m       impact     -126 -110 38 55                land
@@ -108,7 +110,8 @@ from backward_fields_io import load_channel_members  # noqa: E402
 import ensemble_horizon as eh  # noqa: E402
 
 # The companion study's PNW impact domain, verbatim from its own case definition
-# (lon [-126, -110] lat [38, 55], used with mask land).
+# (rewinding-the-extremes, scripts/_shared/cases/pnw_heatwave.yaml: regions.impact
+# lon [-126, -110] lat [38, 55], used with mask land).
 # It is the right default for PNW t2m ONLY; see the (case, variable) table in the module
 # docstring for every other combination.
 # Only a DEFAULT -- --box overrides, and --no_box reduces globally.

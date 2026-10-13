@@ -82,6 +82,12 @@ sbatch --array=1-250%32 analysis/backward_rollout_ensemble.sbatch rewind_fcn3_en
        fcn3_ens_10yr 30 4 2021-06-28T12:00
 ```
 
+The events, windows and analysis regions follow the companion study *Extremes on Rewind*
+(Lin et al. 2026, [arXiv:2608.19008](https://arxiv.org/abs/2608.19008); code and case
+definitions at [jerrylin96/rewinding-the-extremes](https://github.com/jerrylin96/rewinding-the-extremes),
+`scripts/_shared/cases/*.yaml`). The per-(case, variable) reduction boxes are tabulated in the
+docstring of `analysis/plot_ensemble_horizon.py`.
+
 ### Choosing the anchor date
 
 The rollout **starts at the anchor and walks into the past**, so the anchor is the *latest*
