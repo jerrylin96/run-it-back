@@ -1,0 +1,124 @@
+#!/bin/bash
+# ============================================================================
+# crun — run ONE command inside makani.sif on a COMPUTE NODE (never the login
+# node), with the standard bind-mounts already set up. This wraps the recurring
+#   srun -p <part> --time=<t> apptainer exec [--nv] --bind ... <IMG> <cmd>
+# incantation so day-to-day container commands (wandb sync, plotting, quick
+# python, stats checks) are one short line.
+#
+# WHY: apptainer must NOT run on the login node (it can't start the 6.4 GB NFS
+# .sif inside its 60 s probe under load -> FATAL context-deadline). So every
+# container command has to land on a compute node via srun. This automates that.
+#
+# USAGE:
+#   crun wandb sync /work/.../runs/<target>/<run>/wandb/offline-run-*
+#   crun python /opt/makani/analysis/plot_loss_from_log.py 8ch=.../out.log --out .../loss.png
+#   crun --gpu python -m makani.inference ...        # GPU task (adds --nv + a GPU)
+#   crun --shell                                     # interactive container shell
+#   crun -t 00:30:00 -m 32G -- wandb sync /path      # -- separates crun opts from the command
+#
+# OPTIONS (before the command):
+#   --gpu            request 1 GPU + --nv (default partition -> rtx-devel)
+#   --shell          open an interactive bash shell in the container instead of running a command
+#   -p PARTITION     override the SLURM partition (default: cpu, or rtx-devel with --gpu)
+#   -t HH:MM:SS      override the time limit (default: 00:20:00)
+#   -m MEM           override the memory request (default: 16G; -m none = cluster default).
+#                    The cluster's DefMemPerCPU is small enough that an ordinary analysis
+#                    task OOMs on it: plot_ensemble_horizon.py peaks ~1.5 GB per case
+#                    streaming 0.25-deg ensemble dumps and was OOM-killed at the default.
+#                    A default that fits our own tools beats a default that silently kills
+#                    them 30 minutes in; raise it for anything that holds a whole field set.
+#   --               stop option parsing; everything after is the command (needed if the command starts with -p/-t)
+#
+# SITE CONFIG: site.env next to this script supplies MAKANI_IMG (the .sif) and MAKANI_DATA
+# (the data root, bind-mounted at the same path). ENV OVERRIDES:
+#   CRUN_IMG    path to the .sif        (default: $MAKANI_IMG from site.env)
+#   CRUN_CODE   checkout bind-mounted at /opt/makani = LIVE code (default: this script's directory)
+#   CRUN_PARTITION / CRUN_TIME / CRUN_MEM   defaults for -p / -t / -m
+# ============================================================================
+set -euo pipefail
+
+# Bind the checkout that THIS script lives in at /opt/makani, so in-container code == the code
+# you're running (the repo's dev workflow), and behaves the same from any directory. readlink -f
+# resolves an alias OR a ~/bin symlink to the real file, so `dirname` lands on the actual checkout.
+_crun_self="$(readlink -f "${BASH_SOURCE[0]}")"
+CODE="${CRUN_CODE:-$(dirname "$_crun_self")}"
+# site-specific paths (image, data root) live in site.env at the repo root
+[ -f "$(dirname "$_crun_self")/site.env" ] && source "$(dirname "$_crun_self")/site.env"
+IMG="${CRUN_IMG:-${MAKANI_IMG:-}}"
+PARTITION="${CRUN_PARTITION:-cpu}"
+TIME="${CRUN_TIME:-00:20:00}"
+MEM="${CRUN_MEM:-16G}"
+
+# fail with a usable message (not a set -u "unbound variable" crash) when a flag is missing its arg
+need_arg() { [ "$#" -ge 2 ] || { echo "crun: option '$1' requires an argument" >&2; exit 2; }; }
+
+GPU=0
+SHELL_MODE=0
+partition_set_by_flag=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --gpu)   GPU=1; shift ;;
+    --shell) SHELL_MODE=1; shift ;;
+    -p)      need_arg "$@"; PARTITION="$2"; partition_set_by_flag=1; shift 2 ;;
+    -t)      need_arg "$@"; TIME="$2"; shift 2 ;;
+    -m)      need_arg "$@"; MEM="$2"; shift 2 ;;
+    --)      shift; break ;;
+    -*)      echo "crun: unknown option '$1' (use -- before a command that starts with a dash)" >&2; exit 2 ;;
+    *)       break ;;   # first non-option token = start of the command
+  esac
+done
+
+# GPU tasks need a GPU partition; default to rtx-devel (cheap) unless the user picked one with -p.
+NV=""
+GRES=""
+if [ "$GPU" = 1 ]; then
+  NV="--nv"
+  GRES="--gres=gpu:1"
+  [ "$partition_set_by_flag" = 1 ] || PARTITION="${CRUN_PARTITION:-rtx-devel}"
+fi
+
+# standard bind-mounts: the data root (same path inside and out, so config paths resolve), the live
+# code at /opt/makani, and any extra binds from CRUN_EXTRA_BINDS (space-separated src:dst pairs).
+BINDS=()
+[ -n "${MAKANI_DATA:-}" ] && [ -d "$MAKANI_DATA" ] && BINDS+=(--bind "$MAKANI_DATA":"$MAKANI_DATA")
+[ -d "$CODE" ] && BINDS+=(--bind "$CODE":/opt/makani)
+for _b in ${CRUN_EXTRA_BINDS:-}; do BINDS+=(--bind "$_b"); done
+
+# An srun flag, not an apptainer one, so it is (correctly) dropped on the in-allocation path
+# below, where the memory was already fixed by whatever requested the allocation.
+MEMFLAG=""
+case "$MEM" in
+  none|NONE|"") ;;                       # explicit opt-out -> inherit the cluster default
+  *) MEMFLAG="--mem=$MEM" ;;
+esac
+
+[ -n "$IMG" ] && test -f "$IMG" || { echo "crun: image not found: '$IMG' (set MAKANI_IMG in site.env or CRUN_IMG)" >&2; exit 1; }
+
+# If already inside a SLURM allocation (an interactive `srun --pty` shell, or a batch job), do NOT
+# nest another srun — that spawns a sub-step that can hang ("Job step creation temporarily
+# disabled"). We're already on a compute node, so exec apptainer directly. -p/-t are moot here (you
+# can't re-request resources inside an allocation); --gpu still adds --nv, but the GPU has to already
+# be in the allocation. GRES is an srun flag, not an apptainer one, so it is correctly dropped.
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+  if [ "$SHELL_MODE" = 1 ]; then
+    echo "crun: inside SLURM job $SLURM_JOB_ID; opening shell directly (no nested srun)" >&2
+    exec apptainer exec $NV "${BINDS[@]}" "$IMG" bash
+  fi
+  [ "$#" -ge 1 ] || { echo "usage: crun [--gpu] [--shell] [-p PART] [-t HH:MM:SS] [-m MEM] [--] <command> [args...]" >&2; exit 2; }
+  echo "crun: inside SLURM job $SLURM_JOB_ID; running directly (no nested srun): $*" >&2
+  exec apptainer exec $NV "${BINDS[@]}" "$IMG" "$@"
+fi
+
+if [ "$SHELL_MODE" = 1 ]; then
+  echo "crun: interactive shell on $PARTITION (${TIME}) in $(basename "$IMG")" >&2
+  exec srun -p "$PARTITION" $GRES --time="$TIME" $MEMFLAG --pty \
+       apptainer exec $NV "${BINDS[@]}" "$IMG" bash
+fi
+
+[ "$#" -ge 1 ] || { echo "usage: crun [--gpu] [--shell] [-p PART] [-t HH:MM:SS] [-m MEM] [--] <command> [args...]" >&2; exit 2; }
+
+echo "crun: [$PARTITION ${TIME}${MEMFLAG:+ $MEM}] $*" >&2
+exec srun -p "$PARTITION" $GRES --time="$TIME" $MEMFLAG \
+     apptainer exec $NV "${BINDS[@]}" "$IMG" "$@"

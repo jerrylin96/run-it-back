@@ -1,0 +1,885 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import gc
+import time
+from typing import Optional
+import numpy as np
+from tqdm import tqdm
+
+# torch
+import torch
+from torch import amp
+import torch.distributed as dist
+
+import wandb
+
+# timers
+from makani.utils.profiling import Timer
+
+# makani depenedencies
+from makani.utils import LossHandler, MetricsHandler
+from makani.utils.functions import expand_ensemble
+from makani.utils.driver import Driver
+from makani.utils.training import Trainer
+from makani.utils.dataloader import get_dataloader
+from makani.utils.dataloaders.data_helpers import get_climatology
+from makani.utils.YParams import YParams
+
+# model registry
+from makani.models import model_registry
+
+# distributed computing stuff
+from makani.utils import comm
+from makani.utils.precision import AutocastManager
+from makani.utils import visualize
+
+from makani.mpu.mappings import init_gradient_reduction_hooks
+from makani.mpu.helpers import sync_params, gather_uneven
+
+# for counting model parameters
+from makani.models.helpers import count_parameters
+
+# checkpoint helpers
+from makani.utils.checkpoint_helpers import get_latest_checkpoint_version
+
+# weight normalizing helper
+from makani.utils.training.training_helpers import get_memory_usage, clip_grads, update_val_tracking, should_stop_training, should_skip_step
+
+class EnsembleTrainer(Trainer):
+    """
+    Trainer class holding all the necessary information to perform training.
+    """
+
+    def __init__(self, params: Optional[YParams] = None, world_rank: Optional[int] = 0, device: Optional[str] = None):
+        Driver.__init__(self, params, world_rank, device)
+
+        # init wandb
+        with Timer() as timer:
+            if self.log_to_wandb:
+                self._init_wandb(self.params, job_type="ensemble")
+        self.timers["wandb init"] = timer.time
+
+        # set checkpoint version: start at -1 so that first version which is written is 0
+        self.checkpoint_version_current = -1
+
+        # init nccl: do a single AR to make sure that SHARP locks
+        # on to the right tree, and that barriers can be used etc
+        with Timer() as	timer:
+            if dist.is_initialized():
+                tens = torch.ones(1, device=self.device)
+                dist.all_reduce(tens, group=comm.get_group("data"))
+        self.timers["nccl init"] = timer.time
+
+        # set up mixed precision (amp dtype + optional transformer-engine fp8 recipe).
+        # the manager parses the mode once and hands out a single nested autocast cm.
+        amp_mode = self.params.amp_mode if hasattr(self.params, "amp_mode") else "none"
+        self.autocast = AutocastManager(amp_mode, device_type="cuda", fp8_group=comm.get_group("data"))
+        self.amp_dtype = self.autocast.amp_dtype
+        self.amp_enabled = self.autocast.amp_enabled
+        if self.amp_enabled and self.log_to_screen:
+            self.logger.info(f"Enabling automatic mixed precision in '{amp_mode}'.")
+
+        # initialize data loader
+        with Timer() as	timer:
+            if self.log_to_screen:
+                self.logger.info(f"Using channel names: {self.params.channel_names}")
+                self.logger.info("initializing data loader")
+            self.train_dataloader, self.train_dataset, self.train_sampler = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+            self.valid_dataloader, self.valid_dataset, self.valid_sampler = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+            self._set_data_shapes(self.params, self.valid_dataset)
+            # obtain the true lon lat grid after cropping and resampling
+            self.lat_global = torch.as_tensor(self.valid_dataset.lat_lon_local[0]).to(self.device)
+            self.lon_global = torch.as_tensor(self.valid_dataset.lat_lon_local[1]).to(self.device)
+            if comm.get_size("h") > 1:
+                self.lat_global = gather_uneven(self.lat_global, 0, "h")
+            if comm.get_size("w") > 1:
+                self.lon_global = gather_uneven(self.lon_global, 0, "w")
+            self.lat_lon_global = (self.lat_global.cpu().numpy(), self.lon_global.cpu().numpy())
+        self.timers["dataloader init"] = timer.time
+
+        if self.log_to_screen:
+            self.logger.info("data loader initialized")
+
+        # record data required to reproduce workflow using a model package
+        with Timer() as timer:
+            if self.world_rank == 0:
+                from makani.models.model_package import save_model_package
+                save_model_package(self.params)
+        self.timers["save model package"] = timer.time
+
+        # init preprocessor and model
+        with Timer() as	timer:
+            self.multistep = self.params.n_future > 0
+            self.model = model_registry.get_model(self.params, multistep=self.multistep).to(self.device)
+            self.preprocessor = self.model.preprocessor
+        self.timers["model init"] = timer.time
+
+        # print aux channel names:
+        if self.log_to_screen:
+            self.logger.info(f"Auxiliary channel names: {self.params.aux_channel_names}")
+
+        # if model-parallelism is enabled, we need to sure that shared weights are matching across ranks
+        # as random seeds might get out of sync during initialization
+        # DEBUG: this also needs to be fixed in NCCL
+        # if comm.get_size("model") > 1:
+        with Timer() as timer:
+            sync_params(self.model, mode="broadcast")
+        self.timers["sync parameters"] = timer.time
+
+        # add a barrier here
+        if dist.is_initialized():
+            dist.barrier(device_ids=[self.device.index])
+
+        # define process group for DDP, we might need to override that
+        if dist.is_initialized() and not self.params.disable_ddp:
+            ddp_process_group = comm.get_group("data")
+
+        # log gradients to wandb
+        if self.log_to_wandb:
+            wandb.watch(self.model, log="all")
+
+        # print model
+        if self.log_to_screen:
+            self.logger.info(f"\n{self.model}")
+
+        # metrics handler
+        with Timer() as timer:
+            clim = get_climatology(self.params)
+            clim = torch.from_numpy(clim).to(torch.float32)
+            rollout_length = params.get("valid_autoreg_steps", 0) + 1
+            self.metrics = MetricsHandler(params=self.params, climatology=clim, num_rollout_steps=rollout_length, device=self.device)
+            self.metrics.initialize_buffers()
+        self.timers["metric handler init"] = timer.time
+
+        # loss handler
+        with Timer() as timer:
+            self.loss_obj = LossHandler(self.params)
+            self.loss_obj = self.loss_obj.to(self.device)
+        self.timers["loss handler init"] = timer.time
+
+        # optimizer and scheduler setup
+        # model
+        with Timer() as timer:
+            self.model_optimizer = self.get_optimizer(self.model, self.params)
+            self.model_scheduler = self.get_scheduler(self.model_optimizer, self.params)
+        self.timers["optimizer and scheduler init"] = timer.time
+
+        # gradient scaler
+        self.gscaler = amp.GradScaler("cuda", enabled=self.autocast.grad_scaler_enabled)
+
+        # gradient clipping
+        self.max_grad_norm = self.params.get("optimizer_max_grad_norm", -1.0)
+
+        # we need this further down
+        # Initialize gradient reduction (DDP-like) hooks on the default stream so that
+        # AccumulateGrad nodes use the same stream as training forward/backward,
+        # avoiding "AccumulateGrad node's stream does not match" warnings and CUDA
+        # graph capture issues.
+        with Timer() as timer:
+            if dist.is_initialized() and not self.params.disable_ddp:
+                self.model = init_gradient_reduction_hooks(
+                    self.model,
+                    device=self.device,
+                    reduction_buffer_count=self.params.parameters_reduction_buffer_count,
+                    broadcast_buffers=False,
+                    find_unused_parameters=self.params["enable_grad_anomaly_detection"],
+                    gradient_as_bucket_view=True,
+                    static_graph=False,
+                )
+        self.timers["reduction hooks init"] = timer.time
+
+        # lets get one sample from the dataloader:
+        # set to train just to be safe
+        self._set_train()
+        # get sample and map to gpu
+        iterator = iter(self.train_dataloader)
+        data = next(iterator)
+        gdata = map(lambda x: x.to(self.device), data)
+        # extract unpredicted features
+        inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
+        # flatten
+        inp = self.preprocessor.flatten_history(inp)
+        tar = self.preprocessor.flatten_history(tar)
+        # get shapes
+        inp_shape = inp.shape
+        tar_shape = tar.shape
+
+        with Timer() as timer:
+            self._compile_model(inp_shape)
+        self.timers["compile model"] = timer.time
+
+        # visualization wrapper:
+        with Timer() as timer:
+            out_bias, out_scale = self.train_dataloader.get_output_normalization()
+            self._setup_visualizer(out_bias, out_scale)
+        self.timers["visualizer init"] = timer.time
+
+        # reload checkpoints. best_valid_loss/epochs_since_improvement/divergence_streak are
+        # persisted in the checkpoint so the best-checkpoint gate, early stopping and the
+        # divergence guard survive a resume chain; checkpoints from before these keys existed
+        # leave the defaults below in place.
+        counters = {"iters": 0, "start_epoch": 0, "best_valid_loss": 1.0e6, "epochs_since_improvement": 0, "divergence_streak": 0}
+        if self.params.pretrained and not self.params.resuming:
+            if not self.params.is_set("pretrained_checkpoint_path"):
+                raise ValueError("Error, please specify a valid pretrained checkpoint path")
+
+            # use specified checkpoint
+            checkpoint_path = self.params.pretrained_checkpoint_path
+
+            if self.log_to_screen:
+                self.logger.info(f"Loading pretrained checkpoint {checkpoint_path} in {self.params.load_checkpoint} mode")
+
+            with Timer() as timer:
+                self.restore_from_checkpoint(
+                    checkpoint_path,
+                    model=self.model,
+                    loss=self.loss_obj if self.params.get("load_loss", True) else None,
+                    optimizer=self.model_optimizer if self.params.get("load_optimizer", True) else None,
+                    scheduler=self.model_scheduler if self.params.get("load_scheduler", True) else None,
+                    counters=counters if self.params.get("load_counters", True) else None,
+                    checkpoint_mode=self.params.load_checkpoint,
+                    strict=self.params.get("strict_restore", True),
+                )
+            self.timers["loading checkpoint"] = timer.time
+
+            # override learning rate - useful when restoring optimizer but want to override the LR
+            if self.params.get("override_lr", False):
+                for param_group in self.model_optimizer.param_groups:
+                    param_group["lr"] = self.params.get("lr", 1e-3)
+
+        if self.params.resuming:
+
+            # find latest checkpoint
+            checkpoint_path = self.params.checkpoint_path
+            self.checkpoint_version_current = get_latest_checkpoint_version(checkpoint_path)
+            checkpoint_path = checkpoint_path.format(checkpoint_version=self.checkpoint_version_current, mp_rank="{mp_rank}")
+
+            if self.log_to_screen:
+                self.logger.info(f"Resuming from checkpoint {checkpoint_path} in {self.params.load_checkpoint} mode")
+
+            with Timer() as timer:
+                self.restore_from_checkpoint(
+                    checkpoint_path,
+                    model=self.model,
+                    loss=self.loss_obj if self.params.get("load_loss", True) else None,
+                    optimizer=self.model_optimizer if self.params.get("load_optimizer", True) else None,
+                    scheduler=self.model_scheduler if self.params.get("load_scheduler", True) else None,
+                    counters=counters if self.params.get("load_counters", True) else None,
+                    checkpoint_mode=self.params.load_checkpoint,
+                    strict=self.params.get("strict_restore", True),
+                )
+            self.timers["loading checkpoint"] = timer.time
+
+        # read out counters correctly
+        self.iters = counters["iters"]
+        self.start_epoch = counters["start_epoch"]
+        self.epoch = self.start_epoch
+        self.best_valid_loss = counters["best_valid_loss"]
+        self.epochs_since_improvement = counters["epochs_since_improvement"]
+        self.divergence_streak = counters["divergence_streak"]
+
+        # wait till everybody is ready
+        if dist.is_initialized():
+            dist.barrier(device_ids=[self.device.index])
+
+        # counting runs a reduction so we need to count on all ranks before printing on rank 0
+        pcount, _, _ = count_parameters(self.model, self.device)
+        if self.log_to_screen:
+            self.logger.info("Number of trainable model parameters: {}".format(pcount))
+
+        # allow freezing of model parameters to train only the perturbation
+        if self.params.is_set("freeze_model") and self.params.freeze_model:
+            if self.log_to_screen:
+                self.logger.info(f"Freezing model weights")
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+        # print setup times
+        self._log_timers()
+
+    def _set_train(self):
+        self.model.train()
+        self.loss_obj.train()
+        self.preprocessor.train()
+
+    def _set_eval(self):
+        self.model.eval()
+        self.loss_obj.eval()
+        self.preprocessor.eval()
+
+    def train(self, training_profiler=None, validation_profiler=None):
+        # log parameters
+        if self.log_to_screen:
+            # log memory usage so far
+            all_mem_gb, max_mem_gb = get_memory_usage(self.device)
+            self.logger.info(f"Scaffolding memory high watermark: {all_mem_gb:.2f} GB ({max_mem_gb:.2f} GB for pytorch)")
+            # announce training start
+            self.logger.info("Starting Ensemble Training Loop...")
+
+        # perform a barrier here to make sure everybody is ready
+        if dist.is_initialized():
+            dist.barrier(device_ids=[self.device.index])
+
+        try:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        except ValueError:
+            pass
+
+        training_start = time.time()
+        for epoch in range(self.start_epoch, self.params.max_epochs):
+            # early stopping / divergence guard (both opt-in): stop once the validation loss
+            # has not improved for early_stopping_patience epochs, OR has diverged (blown past
+            # divergence_threshold x best) for divergence_patience consecutive epochs. The
+            # counters are rank-consistent and persisted in the checkpoint, so all ranks break
+            # together AND a stray resume-chain link of an already-stopped run exits here
+            # immediately instead of burning another epoch. best_ckpt is untouched by a
+            # divergence stop (only improving epochs overwrite it), so no skill is lost.
+            stop_reason = should_stop_training(
+                self.epochs_since_improvement,
+                self.divergence_streak,
+                early_stopping_patience=self.params.get("early_stopping_patience", 0),
+                divergence_patience=self.params.get("divergence_patience", 0),
+            )
+            if stop_reason is not None:
+                if self.log_to_screen:
+                    if stop_reason == "divergence":
+                        self.logger.info(
+                            f"Divergence stop at epoch {self.epoch}: validation loss exceeded "
+                            f"{self.params.get('divergence_threshold', 0.0)}x the best ({self.best_valid_loss:.6e}) "
+                            f"for {self.divergence_streak} consecutive epochs"
+                        )
+                    else:
+                        self.logger.info(
+                            f"Early stopping at epoch {self.epoch}: no validation improvement in "
+                            f"{self.epochs_since_improvement} epochs (early_stopping_patience="
+                            f"{self.params.get('early_stopping_patience', 0)}, best validation loss {self.best_valid_loss:.6e})"
+                        )
+                break
+
+            if dist.is_initialized():
+                if self.train_sampler is not None:
+                    self.train_sampler.set_epoch(epoch)
+                if self.valid_sampler is not None:
+                    self.valid_sampler.set_epoch(epoch)
+
+            # start timer
+            epoch_start = time.time()
+
+            # train if not to be skipped
+            if not self.params.get("skip_training", False):
+                train_time, train_data_gb, train_logs = self.train_one_epoch(profiler=training_profiler)
+            else:
+                train_time = 0
+                train_data_gb = 0
+                train_logs = {"train_steps" : 0, "loss" : 0.0}
+
+            if dist.is_initialized():
+                dist.barrier(device_ids=[self.device.index])
+
+            # validate if not to be skipped
+            if not self.params.get("skip_validation", False):
+                valid_time, viz_time, valid_logs = self.validate_one_epoch(epoch, profiler=validation_profiler)
+            else:
+                valid_time = 0
+                viz_time = 0
+                valid_logs = {"base": {}, "metrics": {}}
+
+            if self.params.scheduler == "ReduceLROnPlateau":
+                self.model_scheduler.step(valid_logs["base"]["validation loss"])
+            elif self.model_scheduler is not None:
+                self.model_scheduler.step()
+
+            # track validation improvement + divergence on EVERY rank (the validation loss is
+            # already rank-consistent, cf. the plateau scheduler step above), so the stop
+            # decision at the top of the loop is collective and cannot desync DDP. This also
+            # persists best_valid_loss across the resume chain — the previous local
+            # best_valid_loss = 1.0e6 per train() call let the first epoch after a resume
+            # clobber best_ckpt with a worse model (the same bug, fixed earlier in the
+            # deterministic trainer).
+            valid_loss_improved = False
+            if not self.params.get("skip_validation", False):
+                valid_loss = valid_logs["base"]["validation loss"]
+                self.best_valid_loss, self.epochs_since_improvement, self.divergence_streak, valid_loss_improved = update_val_tracking(
+                    valid_loss,
+                    self.best_valid_loss,
+                    self.epochs_since_improvement,
+                    self.divergence_streak,
+                    min_delta=self.params.get("early_stopping_min_delta", 0.0),
+                    divergence_threshold=self.params.get("divergence_threshold", 0.0),
+                )
+
+            # log learning rate
+            if self.log_to_wandb:
+                for param_group in self.model_optimizer.param_groups:
+                    lr = param_group["lr"]
+                wandb.log({"learning rate": lr}, step=self.epoch)
+
+            # save out checkpoints
+            if (self.data_parallel_rank == 0) and (self.params.save_checkpoint != "none") and not self.params.get("skip_training", False):
+                store_start = time.time()
+                checkpoint_mode = self.params["save_checkpoint"]
+                counters = {
+                    "iters": self.iters,
+                    "epoch": self.epoch,
+                    "best_valid_loss": self.best_valid_loss,
+                    "epochs_since_improvement": self.epochs_since_improvement,
+                    "divergence_streak": self.divergence_streak,
+                }
+
+                # increase checkpoint counter
+                self.checkpoint_version_current = (self.checkpoint_version_current + 1) % self.params.checkpoint_num_versions
+                checkpoint_path = self.params.checkpoint_path.format(checkpoint_version=self.checkpoint_version_current, mp_rank="{mp_rank}")
+
+                # checkpoint at the end of every epoch
+                self.save_checkpoint(checkpoint_path, self.model, self.loss_obj, self.model_optimizer, self.model_scheduler, counters, checkpoint_mode=checkpoint_mode)
+
+                # save best checkpoint (only genuinely improving epochs overwrite it — gated by
+                # update_val_tracking above, which compares against the checkpoint-persisted best)
+                best_checkpoint_path = self.params.best_checkpoint_path.format(mp_rank=comm.get_rank("model"))
+                best_model_checkpoint_saved = os.path.isfile(best_checkpoint_path)
+                if valid_loss_improved or ((not self.params.get("skip_validation", False)) and (not best_model_checkpoint_saved)):
+                    self.save_checkpoint(
+                        self.params.best_checkpoint_path, self.model, self.loss_obj, self.model_optimizer, self.model_scheduler, counters, checkpoint_mode=checkpoint_mode
+                    )
+
+                # time how long it took
+                store_stop = time.time()
+
+                if self.log_to_screen:
+                    self.logger.info(f"Saving checkpoint ({checkpoint_mode}) took: {(store_stop - store_start):.2f} sec")
+
+            # wait for everybody
+            if dist.is_initialized():
+                dist.barrier(device_ids=[self.device.index])
+
+            # end timer
+            epoch_end = time.time()
+
+            # create timing logs:
+            timing_logs = {
+                "epoch time [s]": epoch_end - epoch_start,
+                "training time [s]": train_time,
+                "validation time [s]": valid_time,
+                "visualization time [s]": viz_time,
+                "training step time [ms]": train_logs["train_steps"] and (train_time / train_logs["train_steps"]) * 10**3 or 0,
+                "minimal IO rate [GB/s]": train_time and train_data_gb / train_time or 0,
+            }
+
+            # log metrics:
+            self.log_epoch(train_logs, valid_logs, timing_logs)
+
+            # exit here if not training
+            if self.params.get("skip_training", False):
+                break
+
+        # training done
+        training_end = time.time()
+        if self.log_to_screen:
+            self.logger.info("Total training time is {:.2f} sec".format(training_end - training_start))
+
+        return
+
+    def _ensemble_step(self, inp: torch.Tensor, tar: torch.Tensor):
+        """
+        Single forward on a folded batch of size (B*E, ...).
+
+        The ensemble dim is carried explicitly as dim 1 through unsqueeze+repeat_interleave,
+        then flattened into dim 0 just for the model forward; the prediction reshapes back
+        to (B, E, ...) for the loss. Noise is drawn once at the folded batch so each
+        (batch, ensemble member) pair sees an independent sample.
+        """
+        E = self.params.local_ensemble_size
+        B = inp.shape[0]
+
+        # (B, C, H, W) -> (B*E, C, H, W) with ensemble dim folded into batch
+        # (E==1 short-circuits inside expand_ensemble, no allocation)
+        inp_flat = expand_ensemble(inp, E)
+
+        # pre-adjust the preprocessor's noise state to the folded batch; the model is then
+        # called with update_state=False so it consumes this fresh state directly.
+        self.preprocessor.update_internal_state(replace_state=True, batch_size=inp_flat.shape[0])
+
+        pred_flat = self.model_train(inp_flat, update_state=False)
+
+        # unflatten
+        pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
+
+        loss = self.loss_obj(pred, tar, inp=inp)
+
+        return pred, loss
+
+    def train_one_epoch(self, profiler=None):
+        self.epoch += 1
+        total_data_bytes = 0
+        self._set_train()
+
+        # we need this for the loss average
+        accumulated_loss = torch.zeros((2), dtype=torch.float32, device=self.device)
+
+        if self.max_grad_norm > 0.0:
+            accumulated_grad_norm = torch.zeros((2), dtype=torch.float32, device=self.device)
+        else:
+            accumulated_grad_norm = None
+
+        train_steps = 0
+        skipped_steps = 0
+        # skip-step guard: reject an update whose pre-clip grad norm is non-finite or exceeds this
+        # (0 disables). Reused per step; requires the clip norm, so it's active only with clipping on.
+        # The finite-norm check is exempt for the first grad_skip_warmup_steps iters of a FRESH run:
+        # cold-start per-step grads are legitimately large (~300 measured on the devel smoke; the
+        # epoch-1 AVERAGE of ~2.7 is misleading) and skipping them freezes the weights so the norms
+        # never decay — a permanent stall. iters is checkpoint-persisted,
+        # so resumed / warm-started runs are past warmup and guarded from their first step.
+        grad_skip_threshold = self.params.get("grad_skip_threshold", 0.0)
+        grad_skip_warmup_steps = self.params.get("grad_skip_warmup_steps", 0)
+        train_start = time.perf_counter_ns()
+        self.model_train.zero_grad(set_to_none=True)
+        progress_bar = tqdm(self.train_dataloader, desc=f"Training progress epoch {self.epoch}", disable=not self.log_to_screen)
+        for data in progress_bar:
+            train_steps += 1
+            self.iters += 1
+
+            if torch.cuda.is_available():
+                torch.cuda.nvtx.range_push(f"train step {train_steps}")
+
+            # map to device; materialize to list so we can expand zenith features
+            gdata = [x.to(self.device) for x in data]
+
+            # When training with local_ensemble_size > 1 we fold the ensemble dim into the
+            # batch dim for a single forward pass. The cached unpredicted features (xz, yz)
+            # must therefore also carry an ensemble-expanded batch so shapes line up inside
+            # the preprocessor. x is expanded inside _ensemble_step (to preserve `inp.shape[0]`
+            # semantics below); y stays at its original batch since the loss expects (B, E, ...)
+            # pred vs (B, ...) target.
+            E = self.params.local_ensemble_size
+            if len(gdata) == 4:
+                gdata[2] = expand_ensemble(gdata[2], E)
+                gdata[3] = expand_ensemble(gdata[3], E)
+
+            # do preprocessing
+            inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
+
+            # flatten the history
+            inp = self.preprocessor.flatten_history(inp)
+            tar = self.preprocessor.flatten_history(tar)
+
+            # assuming float32
+            total_data_bytes += inp.nbytes + tar.nbytes
+
+            # check if we need to perform an gacc update
+            do_update = (train_steps % self.params["gradient_accumulation_steps"] == 0)
+            loss_scaling_fact = 1.0
+            if self.params["gradient_accumulation_steps"] > 1:
+                loss_scaling_fact = 1.0 / np.float32(self.params["gradient_accumulation_steps"])
+
+            # accumulate loss into this tensor
+            with self.autocast():
+
+                if do_update:
+                    pred, loss = self._ensemble_step(inp, tar)
+                else:
+                    with self.model_train.no_sync():
+                        pred, loss = self._ensemble_step(inp, tar)
+                loss = loss * loss_scaling_fact
+
+            # backward pass
+            self.gscaler.scale(loss).backward()
+
+            # increment accumulated loss
+            accumulated_loss[0] += loss.detach().clone() * inp.shape[0]
+            accumulated_loss[1] += inp.shape[0]
+
+            # log the loss
+            pbar_postfix = {"loss": loss.item()}
+
+            # perform weight update if requested
+            if do_update:
+                if self.max_grad_norm > 0.0:
+                    self.gscaler.unscale_(self.model_optimizer)
+                    grad_norm = clip_grads(self.model_train, self.max_grad_norm, verbose=self.log_to_screen)
+                    accumulated_grad_norm[0] += grad_norm.detach()
+                    accumulated_grad_norm[1] += 1.0
+                    pbar_postfix["grad norm"] = grad_norm.item()
+
+                # skip-step guard: reject a pathological update (pre-clip norm non-finite or above
+                # grad_skip_threshold) instead of stepping — clipping still steps in the bad
+                # direction; skipping avoids it entirely. Needs the clip norm, so it engages only
+                # with clipping on. The norm is still accumulated above, so a skipped spike still
+                # shows in the logged grad-norm trace.
+                skip_update = (self.max_grad_norm > 0.0) and should_skip_step(grad_norm, grad_skip_threshold, steps_taken=self.iters, warmup_steps=grad_skip_warmup_steps)
+
+                # the skip decision MUST be collective, or ranks desync (one steps, one skips ->
+                # silent weight/Adam-moment divergence DDP never repairs). NB clip_grads does NOT
+                # make the norm rank-consistent here: its all_reduce covers only model-parallel
+                # sharding groups, so under pure DDP each rank computes a LOCAL norm. In practice
+                # those agree bitwise (DDP has already all-reduced the grads themselves), but that
+                # rests on non-contractual kernel determinism — so make it explicit: skip everywhere
+                # if ANY rank says skip. Costs one scalar all-reduce per update step, only when the
+                # guard is enabled (and grad_norm.item() above already pays the host sync).
+                if (grad_skip_threshold > 0.0) and (self.max_grad_norm > 0.0) and dist.is_initialized():
+                    skip_flag = torch.tensor(float(skip_update), device=self.device)
+                    dist.all_reduce(skip_flag, op=dist.ReduceOp.MAX)
+                    skip_update = bool(skip_flag.item() > 0.5)
+                if skip_update:
+                    skipped_steps += 1
+                    if self.log_to_screen:
+                        self.logger.warning(
+                            f"Skip-step guard: rejected optimizer step at iter {self.iters} (epoch {self.epoch}) — "
+                            f"grad norm {grad_norm.item():.3e} is non-finite or exceeds grad_skip_threshold {grad_skip_threshold}"
+                        )
+                else:
+                    self.gscaler.step(self.model_optimizer)
+                # always finalize the scaler iteration: for fp16 this is REQUIRED after unscale_()
+                # even when we skip step() (else the next unscale_() raises), and for bf16 (disabled
+                # scaler) it is a no-op. Skipping only bypasses the optimizer step, not this reset.
+                self.gscaler.update()
+                self.model_train.zero_grad(set_to_none=True)
+
+            if (self.params.print_timings_frequency > 0) and (self.iters % self.params.print_timings_frequency == 0) and self.log_to_screen:
+                running_train_time = time.perf_counter_ns() - train_start
+                print("\n")
+                print(f"Average step time after step {self.iters}: {running_train_time / float(train_steps) * 10**(-6):.1f} ms")
+                print(
+                    f"Average effective io rate after step {self.iters}: {total_data_bytes * float(comm.get_world_size()) / (float(running_train_time) * 10**(-9) * 1024. * 1024. * 1024.):.2f} GB/s"
+                )
+                print(f"Current loss {loss.item()}")
+                print("\n")
+
+            # if logging of weights and grads during training is enabled, write them out at the first step of each epoch
+            if (self.params.dump_weights_and_grads > 0) and ((self.iters - 1) % self.params.dump_weights_and_grads == 0):
+                weights_and_grads_path = self.params["experiment_dir"]
+                if self.log_to_screen:
+                    self.logger.info(f"Dumping weights and gradients to {weights_and_grads_path}")
+                self.dump_weights_and_grads(weights_and_grads_path, self.model, step=(self.epoch * self.params.num_samples_per_epoch + self.iters))
+
+            # set progress bar prefix
+            progress_bar.set_postfix(**pbar_postfix)
+
+            if torch.cuda.is_available():
+                torch.cuda.nvtx.range_pop()
+
+            # profiler step
+            if profiler is not None:
+                profiler.step()
+
+        # average the loss over ranks and steps
+        if dist.is_initialized():
+            dist.all_reduce(accumulated_loss, op=dist.ReduceOp.SUM, group=comm.get_group("data"))
+
+        # add the train loss to logs
+        train_loss = accumulated_loss[0] / (accumulated_loss[1] * loss_scaling_fact)
+        logs = {"loss": train_loss.item()}
+
+        # add train steps to log
+        logs["train_steps"] = train_steps
+
+        # log gradient norm
+        if accumulated_grad_norm is not None:
+            grad_norm = accumulated_grad_norm[0] / accumulated_grad_norm[1]
+            logs["gradient norm"] = grad_norm.item()
+
+        # log skipped optimizer steps (skip-step guard). Always in the logs (wandb-tracked via
+        # train_logs); log_epoch surfaces it in out.log only when > 0, so normal logs are unchanged.
+        logs["skipped steps"] = skipped_steps
+
+        # global sync is in order
+        if dist.is_initialized():
+            dist.barrier(device_ids=[self.device.index])
+
+        # finalize timers
+        train_end = time.perf_counter_ns()
+        train_time = (train_end - train_start) * 10 ** (-9)
+        total_data_gb = (total_data_bytes / (1024.0 * 1024.0 * 1024.0)) * float(comm.get_world_size())
+
+        return train_time, total_data_gb, logs
+
+    def validate_one_epoch(self, epoch, profiler=None):
+        # set to eval
+        self._set_eval()
+
+        # clear cache
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # synchronize
+        if dist.is_initialized():
+            dist.barrier(device_ids=[self.device.index])
+
+        # initialize metrics buffers
+        self.metrics.zero_buffers()
+
+        visualize_data = self.params.log_video and (epoch % self.params.log_video == 0)
+
+        # start the timer
+        valid_start = time.time()
+
+        # create list of states for noised inputs:
+        with torch.inference_mode():
+            with torch.no_grad():
+
+                eval_steps = 0
+                progress_bar = tqdm(self.valid_dataloader, desc=f"Validation progress epoch {self.epoch}", disable=not self.log_to_screen)
+                for data in progress_bar:
+                    eval_steps += 1
+
+                    if torch.cuda.is_available():
+                        torch.cuda.nvtx.range_push(f"eval step {eval_steps}")
+
+                    # map to gpu; materialize to list so we can expand zenith features
+                    gdata = [x.to(self.device) for x in data]
+
+                    # When local_ensemble_size > 1, fold the ensemble dim into the batch dim
+                    # for a single forward pass per rollout step. The zenith features (xz, yz)
+                    # must be expanded so they line up with the folded-batch input; the target
+                    # (y) stays at the original batch — the loss expects (B, E, ...) pred against
+                    # (B, ...) target.
+                    E = self.params.local_ensemble_size
+                    if len(gdata) == 4:
+                        gdata[2] = expand_ensemble(gdata[2], E)
+                        gdata[3] = expand_ensemble(gdata[3], E)
+
+                    # preprocess
+                    inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
+                    inp = self.preprocessor.flatten_history(inp)
+
+                    B = inp.shape[0]
+
+                    # expand the input batch to (B*E, ...) for the folded-batch forward
+                    inp = expand_ensemble(inp, E)
+
+                    # split list of targets (stays at batch B)
+                    tarlist = torch.split(tar, 1, dim=1)
+
+                    # draw a fresh stationary noise state at the folded batch for this episode
+                    self.preprocessor.update_internal_state(replace_state=True, batch_size=inp.shape[0])
+
+                    # loop over lead times
+                    for idt, targ in enumerate(tarlist):
+
+                        # flatten history of the target
+                        targ = self.preprocessor.flatten_history(targ)
+
+                        with self.autocast():
+                            # single forward on the folded batch: at idt==0 the noise state was
+                            # just drawn fresh, so skip the stepper's internal update; for
+                            # subsequent steps run the standard AR update.
+                            pred_flat = self.model_eval(
+                                inp,
+                                update_state=(idt != 0),
+                                replace_state=False,
+                            )
+
+                            # advance the input history / unpredicted features once per step
+                            inp = self.preprocessor.append_history(inp, pred_flat, idt, update_state=True)
+
+                            # reshape back to (B, E, ...) for the loss
+                            pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
+
+                            loss = self.loss_obj(pred, targ, None)
+
+                            # log the loss
+                            progress_bar.set_postfix({"loss": loss.item()})
+
+                        # TODO: move all of this into the visualization handler
+                        if (eval_steps <= 1) and visualize_data:
+                            # create average prediction for deterministic metrics
+                            pred_gather = pred[0, 0, ...].clone()
+                            targ_gather = targ[0, ...].clone()
+
+                            pred_gather = self.metrics._gather_input(pred_gather)
+                            targ_gather = self.metrics._gather_input(targ_gather)
+
+                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt, len(tarlist))
+
+                        # update metrics
+                        self.metrics.update(pred, targ, loss, idt)
+
+                    if torch.cuda.is_available():
+                        torch.cuda.nvtx.range_pop()
+
+                    # profiler step
+                    if profiler is not None:
+                        profiler.step()
+
+                # create final logs
+                logs = self.metrics.finalize()
+
+        # finalize plotting
+        viz_time = time.perf_counter_ns()
+        if visualize_data and self.visualizer is not None:
+            self.visualizer.finalize()
+        viz_time = (time.perf_counter_ns() - viz_time) * 10 ** (-9)
+
+        # global sync is in order
+        if dist.is_initialized():
+            dist.barrier(device_ids=[self.device.index])
+
+        # timer
+        valid_time = time.time() - valid_start
+
+        return valid_time, viz_time, logs
+
+    def log_epoch(self, train_logs, valid_logs, timing_logs):
+        # separator
+        separator = "".join(["-" for _ in range(50)])
+        print_prefix = "    "
+
+        def get_pad(nchar):
+            return "".join([" " for x in range(nchar)])
+
+        if self.log_to_screen:
+            # header:
+            self.logger.info(separator)
+            self.logger.info(f"Epoch {self.epoch} summary:")
+            self.logger.info(f"Performance Parameters:")
+            self.logger.info(print_prefix + "training steps: {}".format(train_logs["train_steps"]))
+            self.logger.info(print_prefix + "validation steps: {}".format(valid_logs["base"]["validation steps"]))
+            all_mem_gb, _ = get_memory_usage(self.device)
+            self.logger.info(print_prefix + f"memory footprint [GB]: {all_mem_gb:.2f}")
+            for key in timing_logs.keys():
+                self.logger.info(print_prefix + key + ": {:.2f}".format(timing_logs[key]))
+
+            # compute padding:
+            print_list = ["training loss", "validation loss"] + list(valid_logs["metrics"].keys())
+            max_len = max([len(x) for x in print_list])
+            pad_len = [max_len - len(x) for x in print_list]
+            # validation summary
+            self.logger.info("Metrics:")
+            self.logger.info(print_prefix + "training loss: {}{}".format(get_pad(pad_len[0]), train_logs["loss"]))
+            if "gradient norm" in train_logs:
+                plen = max_len - len("gradient norm")
+                self.logger.info(print_prefix + "gradient norm: {}{}".format(get_pad(plen), train_logs["gradient norm"]))
+            # surface skipped optimizer steps only when the guard actually fired
+            if train_logs.get("skipped steps", 0):
+                plen = max_len - len("skipped steps")
+                self.logger.info(print_prefix + "skipped steps: {}{}".format(get_pad(plen), train_logs["skipped steps"]))
+            self.logger.info(print_prefix + "validation loss: {}{}".format(get_pad(pad_len[1]), valid_logs["base"]["validation loss"]))
+            for idk, key in enumerate(print_list[3:], start=3):
+                value = valid_logs["metrics"][key]
+                if np.isscalar(value):
+                    self.logger.info(f"{print_prefix}{key}: {get_pad(pad_len[idk])}{value}")
+            self.logger.info(separator)
+
+        if self.log_to_wandb:
+            wandb.log(train_logs, step=self.epoch)
+            wandb.log(valid_logs["base"], step=self.epoch)
+
+            # log metrics
+            wandb.log(valid_logs["metrics"], step=self.epoch, commit=True)
+
+        return

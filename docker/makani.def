@@ -1,0 +1,165 @@
+# Apptainer definition file for Makani — translated from docker/Dockerfile.
+#
+# This builds the *environment* (CUDA, PyTorch, MPI, parallel HDF5, h5py,
+# torch-harmonics, physicsnemo, makani and its deps) into a single read-only
+# makani.sif. For day-to-day development you do NOT rebuild: bind-mount your
+# git checkout over /opt/makani so your edits run live (see %help at the bottom).
+#
+# Build from the ROOT of your makani checkout (the %files paths below are
+# relative to that directory), e.g.:
+#
+#   cd <repo root>
+#   export APPTAINER_CACHEDIR=/path/to/fast/disk/.apptainer/cache
+#   export APPTAINER_TMPDIR=/path/to/fast/disk/.apptainer/tmp
+#   apptainer build --fakeroot /path/to/makani.sif docker/makani.def
+#
+# or, as a batch job, `sbatch docker/build_makani.sbatch` (reads site.env).
+
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.12-py3
+
+# Optional speed-up: if you already pulled the base image as a .sif, reuse it instead of
+# re-fetching from NGC by replacing the two lines above with:
+#   Bootstrap: localimage
+#   From: /path/to/base.sif
+
+%files
+    config         /opt/makani/config
+    docker         /opt/makani/docker
+    data_process   /opt/makani/data_process
+    datasets       /opt/makani/datasets
+    makani         /opt/makani/makani
+    tests          /opt/makani/tests
+    pyproject.toml /opt/makani/pyproject.toml
+    README.md      /opt/makani/README.md
+
+%post
+    set -e
+
+    # --- system packages (wget is used below; libibmad5 for IB) ---
+    apt update -y && apt install -y libibmad5 wget
+
+    # --- upgrade cmake (the HDF5 build wants a recent one) ---
+    apt remove cmake -y
+    pip install --upgrade cmake
+
+    # --- MPI + ONNX ---
+    pip install mpi4py
+    pip install onnxruntime onnxruntime-gpu
+
+    # --- parallel HDF5 2.0.0 from source, then h5py linked against it ---
+    export HDF5_VERSION=2.0.0
+    cd /tmp
+    wget https://support.hdfgroup.org/releases/hdf5/v2_0/v2_0_0/downloads/hdf5-${HDF5_VERSION}.tar.gz
+    gzip -cd hdf5-${HDF5_VERSION}.tar.gz | tar xvf -
+    mkdir hdf5-${HDF5_VERSION}/build && cd hdf5-${HDF5_VERSION}/build
+    cmake -DCMAKE_INSTALL_PREFIX=/opt/hdf5 \
+          -DHDF5_ENABLE_OPTIMIZATION=ON \
+          -DHDF5_ENABLE_ZLIB_SUPPORT=ON \
+          -DHDF5_ENABLE_DIRECT_VFD=ON \
+          -DHDF5_ENABLE_PARALLEL=ON \
+          -DHDF5_TEST_API=ON \
+          -DHDF5_TEST_VFD=ON \
+          -DHDF5_TEST_PARALLEL=ON \
+          ..
+    make -j"$(nproc)" && make install
+    mkdir -p /opt/hdf5/lib/plugin
+    CC="mpicc" HDF5_MPI=ON H5PY_DIRECT_VFD=1 HDF5_DIR=/opt/hdf5 \
+        pip install --no-build-isolation --no-binary=h5py h5py==3.16.0
+
+    # --- data + IO tooling ---
+    pip install "cdsapi>=0.7.2"
+    pip install more_itertools zarr xarray gcsfs boto3
+    pip install moviepy
+    pip install --upgrade wandb ruamel.yaml tqdm
+
+    # --- scoring / benchmarking ---
+    pip install xskillscore properscoring
+    pip install "git+https://github.com/google-research/weatherbench2.git"
+    pip install --ignore-installed "git+https://github.com/NVIDIA/mlperf-common.git"
+
+    # --- physicsnemo ---
+    pip install git+https://github.com/NVIDIA/physicsnemo.git@v1.3.0
+
+    # --- torch-harmonics with CUDA extensions, built for the target GPUs ---
+    # 10.0 = B200, 12.0 = RTX PRO 6000 (both Blackwell); +PTX embeds forward-compat
+    # PTX. Prepend "8.0 8.6 9.0" for Ampere/Hopper.
+    #
+    # BUILD_CPP/BUILD_CUDA=1 are REQUIRED: torch-harmonics 0.9.x restructured its
+    # extensions (disco_helpers + a disco_kernels/attention custom-op library) and RENAMED
+    # the build switches — the old FORCE_CUDA_EXTENSION is silently ignored, and with no GPU
+    # visible inside %post (apptainer build has no --nv), BUILD_CUDA defaults OFF. An image
+    # built that way has CPU-only disco kernels, the runtime gate happily takes the optimized
+    # path anyway, and the FIRST FCN3 (DISCO) step on a GPU dies with
+    # "NotImplementedError: Could not run 'disco_kernels::forward' ... 'CUDA' backend".
+    # The old var is kept alongside the new ones so the recipe builds CUDA kernels on either
+    # side of the rename. The PyPI 0.9.x wheels are CPU-only, so building from source with
+    # these switches is the only path to GPU DISCO.
+    pip install setuptools_scm
+    export FORCE_CUDA_EXTENSION=1
+    export BUILD_CPP=1
+    export BUILD_CUDA=1
+    export TORCH_CUDA_ARCH_LIST="10.0 12.0+PTX"
+    cd /opt
+    # PINNED (was @main — the unpinned clone is how the silent env-var rename slipped in;
+    # pyproject.toml requires torch-harmonics>=0.9.0). Bump deliberately, never implicitly.
+    git clone --branch v0.9.1 --depth 1 https://github.com/NVIDIA/torch-harmonics.git
+    cd torch-harmonics
+    pip install --no-build-isolation -e .
+
+    # FAIL THE BUILD if the CUDA disco kernels did not actually compile — this is the
+    # fail-loud lock for the silent-CPU-only failure mode above. cuda_kernels_is_available
+    # reports what was BAKED IN at compile time, so it is answerable without a GPU.
+    python -c "from disco_helpers import cuda_kernels_is_available as c; \
+assert c(), 'torch-harmonics built WITHOUT CUDA disco kernels — check BUILD_CUDA/nvcc'; \
+print('torch-harmonics CUDA disco kernels: BAKED IN')"
+
+    # --- makani itself (editable; bind-mount your checkout over /opt/makani to develop) ---
+    cd /opt/makani
+    pip install --no-deps -e .
+
+    # --- neutralize the NGC forward-compat CUDA libs (durable fix for CUDA error 803) ---
+    # The base image ships forward-compat libcuda in /usr/local/cuda/compat and puts it FIRST on
+    # LD_LIBRARY_PATH. Its ONLY purpose is to run this container's CUDA on a host whose driver is
+    # OLDER than the container needs. At runtime the NGC entrypoint DROPS these libs when the host
+    # driver is new enough — but under a READ-ONLY apptainer image that removal fails, so once the
+    # host driver is NEWER than the bundled compat libcuda, the stale compat lib shadows the driver
+    # that `apptainer --nv` injects and CUDA init dies with error 803 (cudaErrorSystemDriverMismatch)
+    # on every node. Remove it at BUILD time (writable), so the container always uses the driver
+    # `--nv` injects. Re-add it only if your hosts run a driver OLDER than the container's CUDA.
+    # Interim workaround without a rebuild: bind an empty directory over /usr/local/cuda/compat.
+    rm -rf /usr/local/cuda/compat/lib /usr/local/cuda/compat/lib.real
+
+%environment
+    # make the from-source HDF5 tools (h5dump, etc.) available at runtime
+    export PATH=/opt/hdf5/bin:$PATH
+
+%test
+    # GPU-free sanity check of the parts that are hard to build. The full
+    # `import makani` + CUDA check is the runtime smoke test on a GPU node.
+    # cuda_kernels_is_available() reports the COMPILE-TIME state of the disco custom-op
+    # library, so it is a valid CUDA-kernel check even on a GPU-less build node.
+    python -c "import torch, h5py, torch_harmonics; \
+from disco_helpers import cuda_kernels_is_available as c; \
+assert c(), 'torch-harmonics CUDA disco kernels missing from this image'; \
+print('torch', torch.__version__, '| h5py', h5py.__version__, '| h5py-MPI', h5py.get_config().mpi, \
+'| disco CUDA kernels: baked in')"
+
+%labels
+    org.makani.base    nvcr.io/nvidia/pytorch:25.12-py3
+    org.makani.gpus    "B200 (sm_100) + RTX PRO 6000 (sm_120)"
+
+%help
+    Makani container. The ENVIRONMENT is frozen in this image; your CODE is not.
+    Develop by bind-mounting your live checkout over the baked-in copy at
+    /opt/makani, so edits to models / trainer / configs run with no rebuild:
+
+      REPO=/path/to/your/checkout
+      apptainer exec --nv \
+          --bind "$REPO":/opt/makani \
+          --bind /path/to/data:/path/to/data \
+          makani.sif \
+          python -m makani.ensemble --yaml_config=/opt/makani/config/rewind_fcn3.yaml --config=<target>
+
+    Rebuild the image only when a DEPENDENCY changes (new pip package, bumped
+    torch/torch-harmonics, or a newly registered model entry point).

@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+ARG DLFW_VERSION=25.12
+FROM nvcr.io/nvidia/pytorch:${DLFW_VERSION}-py3
+
+# update repo info
+RUN apt update -y && apt install -y libibmad5
+
+# upgrade cmake
+RUN apt remove cmake -y && \
+    pip install cmake --upgrade
+
+# install mpi4py
+RUN pip install mpi4py
+
+# install onnx
+RUN pip install onnxruntime onnxruntime-gpu
+
+# hdf5 and h5py
+ENV HDF5_VERSION=2.0.0
+RUN cd /tmp && wget https://support.hdfgroup.org/releases/hdf5/v2_0/v2_0_0/downloads/hdf5-${HDF5_VERSION}.tar.gz && \
+    gzip -cd hdf5-${HDF5_VERSION}.tar.gz | tar xvf - && \
+    mkdir hdf5-${HDF5_VERSION}/build && cd hdf5-${HDF5_VERSION}/build && \
+    cmake -DCMAKE_INSTALL_PREFIX=/opt/hdf5 \
+    -DHDF5_ENABLE_OPTIMIZATION=ON \
+    -DHDF5_ENABLE_ZLIB_SUPPORT=ON \
+    -DHDF5_ENABLE_DIRECT_VFD=ON \
+    -DHDF5_ENABLE_PARALLEL=ON \
+    -DHDF5_TEST_API=ON \
+    -DHDF5_TEST_VFD=ON \
+    -DHDF5_TEST_PARALLEL=ON \
+    .. && \
+    make -j 8 && make install && \
+    mkdir -p /opt/hdf5/lib/plugin
+RUN CC="mpicc" HDF5_MPI=ON H5PY_DIRECT_VFD=1 HDF5_DIR=/opt/hdf5 pip install --no-build-isolation --no-binary=h5py h5py==3.16.0
+ENV PATH=/opt/hdf5/bin:${PATH}
+
+# install cdsapi for downloading the dataset
+RUN pip install cdsapi>=0.7.2
+
+# install zarr and data stuff
+RUN pip install more_itertools zarr xarray gcsfs boto3
+
+# moviepy for wandb video logging
+RUN pip install moviepy
+
+# other python stuff
+RUN pip install --upgrade wandb ruamel.yaml tqdm
+
+# scoring tools
+RUN pip install xskillscore properscoring
+
+# weatherbench2
+RUN pip install "git+https://github.com/google-research/weatherbench2.git"
+
+# some useful scripts from mlperf
+RUN pip install --ignore-installed "git+https://github.com/NVIDIA/mlperf-common.git"
+
+# physicsnemo
+RUN pip install git+https://github.com/NVIDIA/physicsnemo.git@v1.3.0
+
+# torch-harmonics
+RUN pip install setuptools_scm
+ENV FORCE_CUDA_EXTENSION 1
+ENV TORCH_CUDA_ARCH_LIST "8.0 8.6 8.7 9.0 10.0+PTX"
+RUN cd /opt && git clone https://github.com/NVIDIA/torch-harmonics.git && \
+    cd torch-harmonics && \
+    pip install --no-build-isolation -e .
+
+# copy source code
+RUN mkdir -p /opt/makani
+COPY config /opt/makani/config
+COPY docker /opt/makani/docker
+COPY data_process /opt/makani/data_process
+COPY datasets /opt/makani/datasets
+COPY makani /opt/makani/makani
+COPY tests /opt/makani/tests
+COPY pyproject.toml /opt/makani/pyproject.toml
+COPY README.md /opt/makani/README.md
+RUN cd /opt/makani && pip install --no-deps -e .

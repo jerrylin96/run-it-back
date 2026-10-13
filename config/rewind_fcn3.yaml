@@ -1,0 +1,317 @@
+# ============================================================================
+# Backward-in-time (retrodiction) ensemble emulator: FourCastNet 3 trained with CRPS +
+# multi-scale input noise to predict X(t - 6 h) from X(t).
+#
+# The backward task is a dataset-level switch (`reverse_time`, see
+# makani/utils/dataloaders/data_loader_multifiles.py); the model, trainer and loss are
+# upstream makani's FCN3 / EnsembleTrainer / CRPS recipe (config/fourcastnet3.yaml).
+#
+# LAUNCH: ensemble targets run via `python -m makani.ensemble` (NOT makani.train — the
+# EnsembleTrainer has its own entry point that wires the extra ["ensemble","batch"]
+# data-parallel split and local_ensemble_size); the deterministic smoke runs via
+# makani.train. train_fcn3.sbatch picks the module from the target name.
+#
+# Targets (pass via --config=<name>):
+#   rewind_fcn3_det_smoke          FCN3 arch, DETERMINISTIC (l2), backward, tiny data —
+#                                  isolates architecture-integration problems (2 GPUs)
+#   rewind_fcn3_ens_smoke          FCN3, ensemble_size 2, CRPS + noise, backward, tiny data —
+#                                  isolates ensemble-integration problems (2 GPUs)
+#   rewind_fcn3_ens_10yr_backward  the trained model: ensemble 8, 2009-2018
+#   rewind_fcn3_ens_casestudy      evaluation-only twin of the trained model for case studies
+#
+# PATHS: every absolute path below sits under /data/makani_era5_fcn3. Set MAKANI_DATA in
+# site.env to the same root (the launchers bind-mount it at the same path inside the
+# container); if your root differs, replace the prefix throughout this file.
+#
+# NOTE on FCN3 constructor keys: the in-repo FCN3 net
+# (makani/models/networks/fourcastnet3.py:AtmoSphericNeuralOperatorNet) takes a SINGLE
+# `embed_dim` (latent width; channel groups are computed internally from channel_names)
+# plus `aux_embed_dim`/`pos_embed_dim`. The upstream config/fourcastnet3.yaml keys
+# `atmo_embed_dim`/`surf_embed_dim`/`encoder_mlp`/`mlp_mode`/`pos_embed` are STALE for this
+# implementation: get_model passes the whole params dict as kwargs and the constructor
+# silently absorbs unknown keys via **kwargs — with only those keys set, FCN3 would build at
+# the constructor default embed_dim=8 (a silently tiny model). So this config sets embed_dim
+# EXPLICITLY and carries only keys the constructor actually consumes
+# (tests/test_configs.py locks this).
+# ============================================================================
+
+base_config: &BASE_CONFIG
+
+    # metadata + data + stats + invariants (built by data_process/{convert_era5,stats_era5,
+    # invariants}.sbatch; see the README)
+    metadata_json_path: "/opt/makani/data_process/examples/metadata_fcn3_72.json"
+
+    train_data_path: "/data/makani_era5_fcn3/train"   # overridden per target
+    valid_data_path: "/data/makani_era5_fcn3/valid"   # 2019
+    inf_data_path:   "/data/makani_era5_fcn3/valid"
+    exp_dir:         "/data/makani_era5_fcn3/runs"
+    n_years: 10                  # informational — loader auto-detects from globbed files
+    img_shape_x: 721
+    img_shape_y: 1440
+
+    min_path: "/data/makani_era5_fcn3/stats/mins.npy"
+    max_path: "/data/makani_era5_fcn3/stats/maxs.npy"
+    time_means_path:      "/data/makani_era5_fcn3/stats/time_means.npy"
+    global_means_path:    "/data/makani_era5_fcn3/stats/global_means.npy"
+    global_stds_path:     "/data/makani_era5_fcn3/stats/global_stds.npy"
+    time_diff_means_path: "/data/makani_era5_fcn3/stats/time_diff_means_dt1.npy"
+    time_diff_stds_path:  "/data/makani_era5_fcn3/stats/time_diff_stds_dt1.npy"
+
+    # multifiles (h5py) loader — REQUIRED for reverse_time (dataloader.py raises otherwise;
+    # the DALI loader does not implement the time reversal). The EnsembleTrainer uses the
+    # SAME get_dataloader as the deterministic trainer, so the reverse_time offset swap
+    # threads through the ensemble data path unchanged.
+    multifiles: !!bool True
+
+    # >>> backward-in-time switch. Every run target below flips this True; the base
+    # stays False so a forward FCN3 twin is a two-line target.
+    reverse_time: !!bool False
+
+    # architecture — FCN3 (AtmoSphericNeuralOperatorNet: hybrid local (DISCO) + global (SFNO)
+    # spherical blocks, separate aux encoder stream). Values from config/fourcastnet3.yaml
+    # where the constructor consumes them; embed_dim set explicitly (see header).
+    nettype: "FCN3"
+    model_grid_type: "equiangular"
+    sht_grid_type: "legendre-gauss"
+    scale_factor: 2              # latent at 360x720 (upstream FCN3)
+    embed_dim: 384               # latent width. MEMORY LEVERS in order if the 72-ch runs OOM:
+                                 #   batch_size / ensemble_size down; --checkpointing_level 1..3
+                                 #   (CLI, activation checkpointing); scale_factor 2 -> 3 (2.25x
+                                 #   cheaper latent — upstream's own experimentation tier, cf.
+                                 #   fourcastnet3.yaml's *_sc3_* targets); embed_dim last.
+    aux_embed_dim: 36            # separate encoder stream for zenith/oro/landmask/noise channels
+    pos_embed_dim: 0             # upstream `pos_embed: False` equivalent for this constructor
+    num_layers: 10
+    sfno_block_frequency: 5      # every 5th block global (SFNO), rest local (DISCO) — upstream
+    filter_basis_type: "morlet"
+    kernel_shape: [3,3]
+    num_groups: 1
+    normalization_layer: "none"
+    hard_thresholding_fraction: 1.0
+    use_mlp: !!bool True
+    mlp_ratio: 2
+    activation_function: "gelu"
+    big_skip: !!bool False
+    bias: !!bool False
+    # FCN3 implements the q*/tcwv output clamp natively (registers water_channels and ReLUs them)
+    clamp_water: !!bool True
+
+    # training — ensemble CRPS objective, copied VERBATIM from config/fourcastnet3.yaml
+    # ENSEMBLE_BASE (pretrain stage-1 flavor: standard "cdf" CRPS). Loss types per the
+    # registry (makani/utils/loss.py: ensemble_crps -> CRPSLoss, ensemble_spectral_crps ->
+    # SpectralCRPSLoss). temp_diff_normalization uses the _dt1 tendency stats; backward
+    # flips their mean's sign (mean ~= 0, std identical — a negligible approximation).
+    losses:
+    -   type: "ensemble_crps"
+        channel_weights: "auto"
+        relative_weight: 1.0
+        temp_diff_normalization: !!bool True
+        parameters:
+            crps_type: "cdf"
+    -   type: "ensemble_spectral_crps"
+        channel_weights: "auto"
+        relative_weight: 0.1
+        temp_diff_normalization: !!bool True
+        parameters:
+            crps_type: "cdf"
+
+    # ensemble size (overridden per target; ensemble.py folds it into the batch dim per GPU,
+    # so per-GPU forward cost/memory ~ (batch_size/NGPU) * ensemble_size samples). The
+    # --ensemble_parallel_size CLI knob splits members across GPUs instead.
+    ensemble_size: 16
+
+    # input noise — FCN3's ensemble-generation mechanism: 8 spatially correlated multi-scale
+    # latent channels, INPUT-only (concatenated as auxiliary channels -> the aux encoder;
+    # never targets). Keys per makani/models/preprocessor.py (type/mode/centered/n_channels/
+    # sigma/kT; lambd defaults to dt*dhours/6 = 1.0 for our 6-hourly single step). kT list
+    # copied verbatim from config/fourcastnet3.yaml (8 scales).
+    input_noise:
+        type: "diffusion"
+        mode: "concatenate"
+        centered: !!bool False
+        n_channels: 8
+        sigma: 1.0
+        kT: [3.0806E-5, 1.2322E-4, 4.9289E-4, 1.9716E-3, 7.8862E-3, 3.1545E-2, 1.2618E-1, 5.0472E-1]
+
+    # lr: upstream FCN3 pretrain uses 5E-4 @ global batch 16; the 10yr target runs global
+    # batch 4 (memory-bound, see that target) and keeps 5E-4 with plateau scheduling. Cold
+    # start is bounded by gradient clipping, not warmup (warmup+plateau is blocked by makani,
+    # driver.py get_scheduler).
+    lr: 5E-4
+    max_epochs: 150              # NON-BINDING ceiling; convergence-driven (plateau + early stopping)
+    batch_size: 8                # GLOBAL batch (makani divides by the batch-parallel size).
+    weight_decay: 0.0
+    # DALI-only keys, IGNORED by the multifiles loader (one epoch = one full pass over
+    # train_data_path — bound epoch length via the DATA, as the smoke targets do).
+    n_train_samples_per_epoch: 8192
+    n_eval_samples: 512
+
+    # convergence-driven recipe: plateau scheduler + early stopping + divergence guard. The
+    # EnsembleTrainer persists best_valid_loss and the patience/divergence counters in the
+    # checkpoint, so the guards survive a resume chain and a resumed run cannot overwrite
+    # best_ckpt with a worse model.
+    scheduler: "ReduceLROnPlateau"
+    scheduler_factor: 0.5
+    scheduler_patience: 5        # an epoch on the 10yr target is ~10 h, so patience is paid in
+                                 #   days; 5 flat epochs (~18k steps, val on the full 2019 year)
+                                 #   is ample to declare a plateau. Invariant kept:
+                                 #   early_stopping_patience ~= 2 x scheduler_patience + margin.
+    lr_warmup_steps: 0           # MUST be 0 with ReduceLROnPlateau (makani raises otherwise)
+    early_stopping_patience: 12  # 5+5+2 = two LR halvings + margin.
+                                 #   MID-RUN SEMANTICS (they differ!): early_stopping_patience is
+                                 #   read from the CONFIG at each launch (only counters are
+                                 #   checkpoint-persisted). scheduler_patience is INSIDE
+                                 #   ReduceLROnPlateau's checkpointed state_dict -> a RESUMED run
+                                 #   keeps its original value. Both take effect only on FRESH runs.
+    early_stopping_min_delta: 1.0E-4   # in CRPS units
+    divergence_threshold: 2.0    # RELATIVE to best val -> objective-agnostic
+    divergence_patience: 2
+    # Skip-step guard: DISABLED (0). Its threshold must be calibrated on the CRPS gradient
+    # scale from a run's grad-norm trace (out.log logs it per epoch; wandb per step); a
+    # miscalibrated threshold skips every step and the run stalls silently. Clipping
+    # (optimizer_max_grad_norm) bounds cold-start steps meanwhile.
+    grad_skip_threshold: 0
+    grad_skip_warmup_steps: 500
+    # inert unless the scheduler is switched
+    scheduler_T_max: 145
+    scheduler_min_lr: 0.0
+    lr_start: 1.0E-5
+    scheduler_step_size: 20
+    scheduler_gamma: 0.5
+
+    verbose: !!bool False
+    # wireup_info/wireup_store (and the ics_type/save_*/masked_acc/maskpath/perturb/
+    # prediction_type block further down): legacy upstream boilerplate, unconsumed by the
+    # current code paths — kept only for diffability with fourcastnet3.yaml.
+    wireup_info: "mpi"
+    wireup_store: "tcp"
+    num_data_workers: 8
+    dt: 1                        # 6-hourly single step (dt in units of dhours=6)
+    n_history: 0
+    prediction_type: "iterative"
+    # the backward targets are trained single-step, so autoregressive validation is OFF.
+    # NB with valid_autoreg_steps 0 the ensemble validation loop reduces to single-step CRPS
+    # on the (B, E, ...) prediction.
+    valid_autoreg_steps: 0
+
+    ics_type: "specify_number"
+    save_raw_forecasts: !!bool True
+    save_channel: !!bool False
+    masked_acc: !!bool False
+    maskpath: None
+    perturb: !!bool False
+    add_noise: !!bool False      # legacy scalar-noise knob; the FCN3 mechanism is input_noise above
+
+    # channel set + normalization: the full FCN3 72 channels, verbatim from upstream
+    # fourcastnet3.yaml — z-score everything except the water channels (q* all levels +
+    # tcwv), which are min/max.
+    channel_names: ["u10m", "v10m", "u100m", "v100m", "t2m", "msl", "tcwv", "u50", "u100", "u150", "u200", "u250", "u300", "u400", "u500", "u600", "u700", "u850", "u925", "u1000", "v50", "v100", "v150", "v200", "v250", "v300", "v400", "v500", "v600", "v700", "v850", "v925", "v1000", "z50", "z100", "z150", "z200", "z250", "z300", "z400", "z500", "z600", "z700", "z850", "z925", "z1000", "t50", "t100", "t150", "t200", "t250", "t300", "t400", "t500", "t600", "t700", "t850", "t925", "t1000", "q50", "q100", "q150", "q200", "q250", "q300", "q400", "q500", "q600", "q700", "q850", "q925", "q1000"]
+    normalization: {"tcwv": "minmax", "q50": "minmax", "q100": "minmax", "q150": "minmax", "q200": "minmax", "q250": "minmax", "q300": "minmax", "q400": "minmax", "q500": "minmax", "q600": "minmax", "q700": "minmax", "q850": "minmax", "q925": "minmax", "q1000": "minmax"}
+
+    # invariants (built by data_process/make_invariants.py, geo-sanity gated). Zenith is
+    # computed on the fly, time-aligned to the swapped target timestamp under reverse_time
+    # (dataset-level, architecture-agnostic).
+    add_grid: !!bool False
+    gridtype: "sinusoidal"       # only read when add_grid: True (inert here)
+    grid_num_frequencies: 16
+    add_zenith: !!bool True
+    add_orography: !!bool True
+    orography_path: "/data/makani_era5_fcn3/invariants/orography.h5"
+    add_landmask: !!bool True
+    landmask_path: "/data/makani_era5_fcn3/invariants/land_sea_mask.h5"
+    landmask_preprocessing: "floor"
+
+    pretrained: !!bool False
+
+    log_to_screen: !!bool True
+    log_to_wandb: !!bool True    # offline mode via the sbatch WANDB_MODE=offline default
+    log_video: 0
+    save_checkpoint: "legacy"
+
+    optimizer_type: "Adam"
+    optimizer_beta1: 0.9
+    optimizer_beta2: 0.95
+    optimizer_max_grad_norm: 16  # also the cold-start bound (no warmup)
+
+    wandb_name: None
+    wandb_group: "rewind_fcn3"
+    wandb_project: "run-it-back"
+    wandb_entity: None
+
+# ============================ run targets ====================================
+
+# ---- ARCHITECTURE shakedown (deterministic FCN3 backward) ---------------------
+# Runs via makani.train (deterministic trainer). Purpose: does the FCN3 entry point wire up
+# BACKWARD at all — builds, trains a few full passes on tiny data, checkpoints, resumes —
+# with the ensemble machinery entirely out of the loop (l2 loss, no input_noise,
+# ensemble_size inert under this trainer). Tiny epoch via DATA (train on the 1-yr valid dir),
+# NOT n_train_samples_per_epoch (DALI-only no-op). 2 GPUs: batch 4 -> 2/GPU.
+rewind_fcn3_det_smoke:
+    <<: *BASE_CONFIG
+    reverse_time: !!bool True
+    train_data_path: "/data/makani_era5_fcn3/valid"
+    batch_size: 4
+    max_epochs: 3
+    losses:
+    -   type: "l2"
+        channel_weights: "auto"
+        temp_diff_normalization: !!bool True
+        parameters:
+            squared: !!bool True
+    input_noise: null            # no noise channels in the deterministic arm
+
+# ---- ENSEMBLE shakedown (tiny ensemble, CRPS + noise) -------------------------
+# Runs via makani.ensemble (EnsembleTrainer). Purpose: the ensemble/CRPS/noise machinery
+# end-to-end backward — folded-batch forward, (B,E,...) CRPS, noise-as-aux-channels, ensemble
+# checkpoint/resume — at the smallest ensemble that exercises a real spread (E=2). Same tiny
+# data. 2 GPUs: batch 2 -> 1/GPU x E2 = 2 samples/GPU forward. 4 folded samples/GPU is the
+# ceiling of a 178-GiB GPU for this architecture at --checkpointing_level=3 (see the 10yr
+# target); without checkpointing 2 samples/GPU is the ceiling.
+rewind_fcn3_ens_smoke:
+    <<: *BASE_CONFIG
+    reverse_time: !!bool True
+    train_data_path: "/data/makani_era5_fcn3/valid"
+    batch_size: 2
+    max_epochs: 3
+    ensemble_size: 2
+
+# ---- THE TRAINED MODEL: ensemble 8, 2009-2018 ---------------------------------
+# train_10yr is a directory holding (or symlinking) the 2009..2018 year files.
+#
+# SIZING: FCN3's decoder DISCO convolution allocates one fp32 buffer of ~13.37 GiB per
+# FOLDED sample (batch x members on one GPU) and then casts it to bf16, so a 178-GiB GPU
+# caps at 4 folded samples/GPU at --checkpointing_level=3 (measured: PASS at 4, OOM at 8
+# and 16). E=8 and global batch 4: folded/GPU on an 8-GPU node = batch x E / world =
+# 4x8/8 = 4, which REQUIRES the ensemble split (batch 4 alone violates 8-way batch
+# divisibility):
+#   sbatch train_fcn3.sbatch rewind_fcn3_ens_10yr_backward fcn3_ens_10yr \
+#          --ensemble_parallel_size=2 --checkpointing_level=3
+# Epoch estimate at ~9.5 s/it: 14.6k samples / batch 4 ~= 3.7k steps ~= 10 h + validation
+# -> ~2 epochs per 1-day job; chain with --dependency=afterany.
+rewind_fcn3_ens_10yr_backward:
+    <<: *BASE_CONFIG
+    reverse_time: !!bool True
+    train_data_path: "/data/makani_era5_fcn3/train_10yr"   # 2009-2018
+    ensemble_size: 8
+    batch_size: 4
+
+# ---- CASE STUDY: retrodict a specific event from a specific year -------------
+# EVALUATION-ONLY (never trained). Identical architecture to the 10yr target — the trained
+# checkpoint loads into it unchanged — differing ONLY in inf_data_path, the knob the rollout
+# harness reads (verify_direction.build_inferencer -> Inferencer -> params.inf_data_path).
+# Point it at a directory holding the converted year (data_process/convert_casestudy.sbatch,
+# or a subset cut with data_process/subset_time_range.py), then anchor the rollout on the
+# event date:
+#   sbatch analysis/backward_rollout_fcn3.sbatch rewind_fcn3_ens_casestudy fcn3_ens_10yr \
+#          40 1 8 1 all --anchor_date 2021-06-28
+#   sbatch --array=1-250%32 analysis/backward_rollout_ensemble.sbatch   # the 1000-member pool
+# See docs/case_study_recipe.md for the full recipe (data prep, GPU sizing, outputs).
+# NB the loader globs the directory and reads each file's OWN timestamp dimension scale, so a
+# subset file self-describes its dates — but keep exactly one non-overlapping slice per dir.
+rewind_fcn3_ens_casestudy:
+    <<: *BASE_CONFIG
+    reverse_time: !!bool True
+    ensemble_size: 8
+    batch_size: 4
+    inf_data_path:   "/data/makani_era5_fcn3/casestudy"
+    valid_data_path: "/data/makani_era5_fcn3/casestudy"

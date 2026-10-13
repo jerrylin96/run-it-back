@@ -1,0 +1,1083 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import importlib.util
+import os
+import sys
+import glob
+import copy
+import math
+import tempfile
+import datetime as dt
+from typing import Optional
+from parameterized import parameterized, parameterized_class
+
+import unittest
+import torch
+import numpy as np
+import h5py as h5
+import zarr
+
+from makani.utils.dataloader import get_dataloader
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from .testutils import disable_tf32, get_default_parameters, init_hdf5_dataset, init_zarr_dataset, init_wb2_zarr_dataset, compare_tensors, compare_arrays
+from .testutils import H5_PATH, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W, CHANNEL_NAMES
+
+_multifiles_params = [True]
+# find_spec("nvidia.dali") imports the PARENT package first, so on a machine with no
+# nvidia-* wheel at all (e.g. the CPU-only CI runner) it RAISES ModuleNotFoundError for
+# the missing "nvidia" namespace instead of returning None — guard both outcomes.
+try:
+    _have_dali = importlib.util.find_spec("nvidia.dali") is not None
+except ModuleNotFoundError:
+    _have_dali = False
+
+if _have_dali:
+    _multifiles_params.append(False)
+
+_dali_devices = [("cpu",)]
+if torch.cuda.is_available():
+    _dali_devices.append(("gpu",))
+
+
+def get_sample(path: str, idx):
+    files = sorted(glob.glob(os.path.join(path, "*.h5")))
+    h5file = h5.File(files[0], "r")
+    num_samples_per_file = h5file[H5_PATH].shape[0]
+    h5file.close()
+    file_id = idx // num_samples_per_file
+    file_index = idx % num_samples_per_file
+
+    with h5.File(files[file_id], "r") as f:
+        data = f[H5_PATH][file_index, ...]
+
+    return data
+
+
+def get_zarr_sample(path: str, idx):
+    files = sorted(glob.glob(os.path.join(path, "*.zarr")))
+    first = zarr.open_group(files[0], mode="r")
+    num_samples_per_file = first[H5_PATH].shape[0]
+    file_id = idx // num_samples_per_file
+    file_index = idx % num_samples_per_file
+    g = zarr.open_group(files[file_id], mode="r")
+    return np.array(g[H5_PATH][file_index, ...])
+
+
+def get_wb2_zarr_sample(path: str, idx: int, channel_names=None):
+    """Read one sample from a WB2-layout zarr store and return it as (C, H, W)."""
+    from makani.utils.dataloaders.wb2_helpers import build_wb2_channel_map
+
+    if channel_names is None:
+        channel_names = list(CHANNEL_NAMES)
+
+    files = sorted(glob.glob(os.path.join(path, "*.zarr")))
+    first = zarr.open_group(files[0], mode="r")
+    level_values = np.asarray(first["level"]) if "level" in first else None
+    channel_map = build_wb2_channel_map(channel_names, level_values)
+    probe_name = channel_map[0][0]
+    num_samples_per_file = first[probe_name].shape[0]
+
+    file_id = idx // num_samples_per_file
+    file_index = idx % num_samples_per_file
+    g = zarr.open_group(files[file_id], mode="r")
+
+    h, w = first[probe_name].shape[-2], first[probe_name].shape[-1]
+    result = np.zeros((len(channel_names), h, w), dtype=np.float32)
+    for ch_idx, (zarr_name, level_idx) in enumerate(channel_map):
+        if level_idx is None:
+            result[ch_idx] = g[zarr_name][file_index]
+        else:
+            result[ch_idx] = g[zarr_name][file_index, level_idx]
+    return result
+
+
+def init_dataset_params(
+    train_path: str,
+    valid_path: str,
+    stats_path: str,
+    batch_size: int,
+    n_history: int,
+    n_future: int,
+    normalization: str,
+    num_data_workers: int,
+):
+
+    # instantiate params base
+    params = get_default_parameters()
+
+    # init paths
+    params.train_data_path = train_path
+    params.valid_data_path = valid_path
+    params.min_path = os.path.join(stats_path, "mins.npy")
+    params.max_path = os.path.join(stats_path, "maxs.npy")
+    params.time_means_path = os.path.join(stats_path, "time_means.npy")
+    params.global_means_path = os.path.join(stats_path, "global_means.npy")
+    params.global_stds_path = os.path.join(stats_path, "global_stds.npy")
+    params.time_diff_means_path = os.path.join(stats_path, "time_diff_means.npy")
+    params.time_diff_stds_path = os.path.join(stats_path, "time_diff_stds.npy")
+
+    # general parameters
+    params.dhours = 24
+    params.h5_path = H5_PATH
+    params.n_history = n_history
+    params.n_future = n_future
+    params.batch_size = batch_size
+    params.normalization = normalization
+
+    # performance parameters
+    params.num_data_workers = num_data_workers
+    params.enable_odirect = False
+    params.odirect_alignment = 0
+    params.enable_s3 = False
+
+    return params
+
+
+class DataLoaderBase:
+    """Shared tests for all dataloader backends (HDF5, zarr-makani, zarr-wb2, …).
+
+    Not a TestCase subclass so pytest does not collect it directly.
+    Concrete subclasses must inherit from both this class and
+    ``unittest.TestCase``, implement ``setUpClass`` / ``tearDownClass``, and
+    implement ``_get_sample``.
+    """
+
+    def _get_sample(self, path, idx):
+        raise NotImplementedError
+
+    def setUp(self):
+        disable_tf32()
+
+        self.params = init_dataset_params(self.train_path, self.valid_path, self.stats_path, batch_size=2, n_history=0, n_future=0, normalization="zscore", num_data_workers=1)
+
+        self.params.multifiles = True
+        self.params.num_train = self.num_train
+        self.params.num_valid = self.num_valid
+
+        # this is also correct for most cases:
+        self.params.io_grid = [1, 1, 1]
+        self.params.io_rank = [0, 0, 0]
+
+        self.num_steps = 5
+
+
+    def _test_shapes_and_sample_counts(self, multifiles):
+
+        # set mutltifiles
+        self.params.multifiles = multifiles
+
+        # create dataloaders
+        valid_loader, valid_dataset, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        # do tests
+        num_valid_steps = self.params.num_valid // self.params.batch_size
+        for idt, token in enumerate(valid_loader):
+            self.assertEqual(len(token), 2)
+            inp, tar = token
+
+            self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+            self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+
+        self.assertEqual((idt + 1), num_valid_steps)
+
+
+    def _test_content(self, multifiles):
+
+        # set mutltifiles
+        self.params.multifiles = multifiles
+
+        # create dataloaders
+        valid_loader, valid_dataset, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        # do tests
+        for idt, token in enumerate(valid_loader):
+            # get loader samples
+            inp, tar = token
+
+            # get test samples
+            off = self.params.batch_size * idt
+            inp_res = []
+            tar_res = []
+            for b in range(self.params.batch_size):
+                inp_res.append(self._get_sample(self.params.valid_data_path, off + b))
+                tar_res.append(self._get_sample(self.params.valid_data_path, off + b + 1))
+            test_inp = np.squeeze(np.stack(inp_res, axis=0))
+            test_tar = np.squeeze(np.stack(tar_res, axis=0))
+
+            inp = np.squeeze(inp.cpu().numpy())
+            tar = np.squeeze(tar.cpu().numpy())
+
+            self.assertTrue(compare_arrays("test_content inp", inp, test_inp))
+            self.assertTrue(compare_arrays("test_content tar", tar, test_tar))
+
+            if idt > self.num_steps:
+                break
+
+    def _test_content_normalization_zscore(self, multifiles):
+        """With non-trivial means/stds, zscore output equals (raw - mean) / std."""
+        self.params.multifiles = multifiles
+
+        # non-trivial stats: per-channel means/stds distinct from (0, 1)
+        rng = np.random.default_rng(seed=1234)
+        means = rng.normal(loc=0.5, scale=1.0, size=(1, NUM_CHANNELS, 1, 1)).astype(np.float64)
+        stds  = rng.uniform(low=0.5, high=2.0, size=(1, NUM_CHANNELS, 1, 1)).astype(np.float64)
+
+        with tempfile.TemporaryDirectory() as tmp_stats:
+            np.save(os.path.join(tmp_stats, "global_means.npy"), means)
+            np.save(os.path.join(tmp_stats, "global_stds.npy"),  stds)
+            # ancillary stats files: copy defaults from the shared stats dir
+            for fname in ("mins.npy", "maxs.npy", "time_means.npy",
+                          "time_diff_means.npy", "time_diff_stds.npy"):
+                src = os.path.join(self.stats_path, fname)
+                np.save(os.path.join(tmp_stats, fname), np.load(src))
+
+            params = copy.deepcopy(self.params)
+            params.global_means_path    = os.path.join(tmp_stats, "global_means.npy")
+            params.global_stds_path     = os.path.join(tmp_stats, "global_stds.npy")
+            params.min_path             = os.path.join(tmp_stats, "mins.npy")
+            params.max_path             = os.path.join(tmp_stats, "maxs.npy")
+            params.time_means_path      = os.path.join(tmp_stats, "time_means.npy")
+            params.time_diff_means_path = os.path.join(tmp_stats, "time_diff_means.npy")
+            params.time_diff_stds_path  = os.path.join(tmp_stats, "time_diff_stds.npy")
+
+            valid_loader, valid_dataset, _ = get_dataloader(params, params.valid_data_path, mode="eval", device=self.device)
+
+            # the same (B, C, 1, 1) stats broadcast over (B, C, H, W) raw samples
+            means_b = means.astype(np.float32)
+            stds_b  = stds.astype(np.float32)
+
+            for idt, token in enumerate(valid_loader):
+                inp, tar = token
+
+                off = params.batch_size * idt
+                inp_raw = np.stack(
+                    [self._get_sample(params.valid_data_path, off + b) for b in range(params.batch_size)],
+                    axis=0,
+                ).astype(np.float32)
+                tar_raw = np.stack(
+                    [self._get_sample(params.valid_data_path, off + b + 1) for b in range(params.batch_size)],
+                    axis=0,
+                ).astype(np.float32)
+
+                # analytical zscore: broadcast (1, C, 1, 1) stats against (B, C, H, W) samples
+                expected_inp = (inp_raw - means_b) / stds_b
+                expected_tar = (tar_raw - means_b) / stds_b
+
+                inp_np = np.squeeze(inp.cpu().numpy())
+                tar_np = np.squeeze(tar.cpu().numpy())
+
+                self.assertTrue(compare_arrays("zscore normalized inp",
+                                               inp_np, np.squeeze(expected_inp),
+                                               atol=1e-5, rtol=1e-4))
+                self.assertTrue(compare_arrays("zscore normalized tar",
+                                               tar_np, np.squeeze(expected_tar),
+                                               atol=1e-5, rtol=1e-4))
+
+                if idt > self.num_steps:
+                    break
+
+    def _test_channel_ordering(self, multifiles):
+
+        # set mutltifiles
+        self.params.multifiles = multifiles
+
+        # create dataloaders
+        valid_loader, valid_dataset, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        # create flipped dataloader
+        params = copy.deepcopy(self.params)
+        params.in_channels = params.in_channels[::-1]
+        params.out_channels = params.out_channels[::-1]
+        valid_loader_flip, valid_dataset_flip, _ = get_dataloader(params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        for idt, (token, token_flip) in enumerate(zip(valid_loader, valid_loader_flip)):
+            inp, tar = token
+            inp_flip, tar_flip = token_flip
+
+            self.assertFalse(compare_tensors("inp vs flipped inp", inp, inp_flip))
+            inp_flip_flip = torch.flip(inp_flip, dims=(2,))
+            self.assertTrue(compare_tensors("inp vs double-flipped inp", inp, inp_flip_flip))
+
+            self.assertFalse(compare_tensors("tar vs flipped tar", tar, tar_flip))
+            tar_flip_flip = torch.flip(tar_flip, dims=(2,))
+            self.assertTrue(compare_tensors("tar vs double-flipped tar", tar, tar_flip_flip))
+
+    def _test_history(self, multifiles):
+
+        # set mutltifiles
+        self.params.multifiles = multifiles
+
+        # set history:
+        self.params.n_history = 3
+
+        # create dataloaders
+        valid_loader, valid_dataset, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        # do tests
+        for idt, token in enumerate(valid_loader):
+            self.assertEqual(len(token), 2)
+            inp, tar = token
+
+            self.assertEqual(tuple(inp.shape), (self.params.batch_size, self.params.n_history + 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+            self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+
+            if idt > self.num_steps:
+                break
+
+    def _test_future(self, multifiles):
+
+        # set mutltifiles
+        self.params.multifiles = multifiles
+
+        # set future:
+        self.params.n_future = 3
+
+        # create dataloaders
+        train_loader, train_dataset, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+
+        # do tests
+        for idt, token in enumerate(train_loader):
+            self.assertEqual(len(token), 2)
+            inp, tar = token
+
+            self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+            self.assertEqual(tuple(tar.shape), (self.params.batch_size, self.params.n_future + 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+
+            if idt > self.num_steps:
+                break
+
+    def _test_autoreg(self, multifiles):
+
+        # set mutltifiles
+        self.params.multifiles = multifiles
+
+        # set autoreg
+        self.params.valid_autoreg_steps = 3
+
+        # create dataloaders
+        valid_loader, valid_dataset, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        # do tests
+        for idt, token in enumerate(valid_loader):
+            self.assertEqual(len(token), 2)
+            inp, tar = token
+
+            self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+            self.assertEqual(tuple(tar.shape), (self.params.batch_size, self.params.valid_autoreg_steps + 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
+
+            if idt > self.num_steps:
+                break
+
+    def _test_reverse_time(self):
+        """reverse_time swaps which frame is input vs target.
+
+        Backward input must equal forward target and backward target must equal forward input.
+        Single-step only (reverse_time requires n_history == n_future); eval mode is unshuffled
+        so forward and backward visit identical indices, and the fixture stats are zero-mean /
+        unit-std so normalization is a pass-through and the swapped frames compare exactly.
+        reverse_time is multifiles-only (the DALI path raises), so this is not parameterized
+        over the DALI backend.
+        """
+        self.params.multifiles = True
+        self.params.n_history = 0
+        self.params.n_future = 0
+        # eval mode derives n_future from valid_autoreg_steps (NOT n_future); pin it to 0 so the
+        # reverse_time n_history == n_future requirement holds and the swap stays single-step.
+        self.params.valid_autoreg_steps = 0
+        self.params.add_zenith = False
+
+        # forward
+        self.params.reverse_time = False
+        fwd_loader, _, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+        fwd_inp, fwd_tar = next(iter(fwd_loader))
+
+        # backward
+        self.params.reverse_time = True
+        bwd_loader, _, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+        bwd_inp, bwd_tar = next(iter(bwd_loader))
+
+        self.assertTrue(compare_tensors("reverse_time: bwd inp vs fwd tar", bwd_inp, fwd_tar))
+        self.assertTrue(compare_tensors("reverse_time: bwd tar vs fwd inp", bwd_tar, fwd_inp))
+
+    def _test_content_in_neq_out_channels(self):
+        """Targets are read with out_channels, inputs with in_channels.
+
+        Locks the latent multifiles fix where targets were read with in_channels yet
+        normalized with out-stats: inert while in == out (the prototype), wrong once
+        in != out -- a regime a different channel configuration can introduce. in/out are chosen as different
+        channel SETS so reading the target with in_channels yields detectably wrong data.
+        The stats fixture is zero-mean / unit-std (testutils) so zscore is a pass-through and
+        the loader output equals the on-disk channels. multifiles-only (DALI path differs).
+        """
+        self.params.multifiles = True
+        self.params.n_history = 0
+        self.params.n_future = 0
+        self.params.valid_autoreg_steps = 0
+        self.params.add_zenith = False
+        in_ch, out_ch = [0, 1, 2], [2, 3, 4]   # different sets, equal length, both sorted
+        self.params.in_channels = in_ch
+        self.params.out_channels = out_ch
+
+        valid_loader, _, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        for idt, token in enumerate(valid_loader):
+            inp, tar = token
+
+            # forward single-step: sample i has input frame i, target frame i+1
+            off = self.params.batch_size * idt
+            inp_res, tar_res = [], []
+            for b in range(self.params.batch_size):
+                inp_res.append(self._get_sample(self.params.valid_data_path, off + b)[in_ch])
+                tar_res.append(self._get_sample(self.params.valid_data_path, off + b + 1)[out_ch])
+            test_inp = np.squeeze(np.stack(inp_res, axis=0))
+            test_tar = np.squeeze(np.stack(tar_res, axis=0))
+
+            inp = np.squeeze(inp.cpu().numpy())
+            tar = np.squeeze(tar.cpu().numpy())
+
+            self.assertTrue(compare_arrays("in!=out: inp uses in_channels", inp, test_inp))
+            self.assertTrue(compare_arrays("in!=out: tar uses out_channels", tar, test_tar))
+
+            if idt > self.num_steps:
+                break
+
+    def _test_timestamp_dt_stride(self):
+        """_compute_timestamps strides by dt so each frame's time matches the frame read.
+
+        _get_data reads frame (global_idx + dt*offset); the timestamps -- and thus the zenith
+        forcing derived from them -- must use the same dt stride. Locks the latent fix where a
+        plain (unstrided) slice returned consecutive timestamps: inert at dt == 1 (the
+        prototype), wrong once dt > 1, a regime a different configuration can introduce. multifiles-only.
+        """
+        self.params.multifiles = True
+        self.params.dt = 2
+        self.params.n_history = 2          # a multi-frame block exposes the stride
+        self.params.n_future = 0
+        self.params.add_zenith = False
+
+        _, dataset, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        dataset.return_timestamp = True    # surface inp/tar timestamps from get_sample_at_index
+
+        gidx = 5
+        # add_zenith=False, return_timestamp=True, return_target=True -> (inp, tar, inp_time, tar_time)
+        inp_time = np.asarray(dataset.get_sample_at_index(gidx, return_target=True)[2].cpu(), dtype=np.float64)
+
+        dt_, n = dataset.dt, dataset.n_history + 1
+        expected = np.asarray(dataset.timestamps[gidx : gidx + dt_ * n : dt_], dtype=np.float64)
+        self.assertEqual(len(inp_time), n)
+        np.testing.assert_array_equal(inp_time, expected)
+        # explicit: frame o's timestamp is the one _get_data reads at global_idx + dt*o
+        for o in range(n):
+            self.assertEqual(inp_time[o], dataset.timestamps[gidx + dt_ * o])
+
+    def _test_distributed(self, multifiles):
+
+        # set multifiles
+        self.params.multifiles = multifiles
+
+        # set IO grid
+        self.params.io_grid = [1, 2, 1]
+        self.params.io_rank = [0, 1, 0]
+
+        valid_loader, valid_dataset, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        off_x = valid_dataset.img_local_offset_x
+        off_y = valid_dataset.img_local_offset_y
+        range_x = valid_dataset.img_local_shape_x
+        range_y = valid_dataset.img_local_shape_y
+
+        # do tests
+        num_steps = 3
+        for idt, token in enumerate(valid_loader):
+            # get loader samples
+            inp, tar = token
+
+            self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
+            self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
+
+            # get test samples
+            off = self.params.batch_size * idt
+            inp_res = []
+            tar_res = []
+            for b in range(self.params.batch_size):
+                tmp = self._get_sample(self.params.valid_data_path, off + b)
+                inp_res.append(tmp[:, off_x : off_x + range_x, off_y : off_y + range_y])
+                tmp = self._get_sample(self.params.valid_data_path, off + b + 1)
+                tar_res.append(tmp[:, off_x : off_x + range_x, off_y : off_y + range_y])
+
+            # stack
+            test_inp = np.squeeze(np.stack(inp_res, axis=0))
+            test_tar = np.squeeze(np.stack(tar_res, axis=0))
+
+            inp = np.squeeze(inp.cpu().numpy())
+            tar = np.squeeze(tar.cpu().numpy())
+
+            self.assertTrue(compare_arrays("test_distributed inp", inp, test_inp))
+            self.assertTrue(compare_arrays("test_distributed tar", tar, test_tar))
+
+            if idt > self.num_steps:
+                break
+
+    def _test_distributed_subsampling(self, multifiles):
+
+        # set multifiles
+        self.params.multifiles = multifiles
+
+        # set subsampling factor
+        subsample = 2
+        self.params.subsampling_factor = subsample
+
+        # set IO grid
+        self.params.io_grid = [1, 2, 1]
+        self.params.io_rank = [0, 1, 0]
+
+        valid_loader, valid_dataset, _ = get_dataloader(self.params, self.params.valid_data_path, mode="eval", device=self.device)
+
+        off_x = valid_dataset.img_local_offset_x
+        off_y = valid_dataset.img_local_offset_y
+        range_x = valid_dataset.img_local_shape_x
+        range_y = valid_dataset.img_local_shape_y
+
+        # do tests
+        num_steps = 3
+        for idt, token in enumerate(valid_loader):
+            # get loader samples
+            inp, tar = token
+
+            self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, math.ceil(range_x / subsample), math.ceil(range_y / subsample)))
+            self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, math.ceil(range_x / subsample), math.ceil(range_y / subsample)))
+
+            # get test samples
+            off = self.params.batch_size * idt
+            inp_res = []
+            tar_res = []
+            for b in range(self.params.batch_size):
+                tmp = self._get_sample(self.params.valid_data_path, off + b)
+                inp_res.append(tmp[:, off_x : off_x + range_x : subsample, off_y : off_y + range_y : subsample])
+                tmp = self._get_sample(self.params.valid_data_path, off + b + 1)
+                tar_res.append(tmp[:, off_x : off_x + range_x : subsample, off_y : off_y + range_y : subsample])
+
+            # stack
+            test_inp = np.squeeze(np.stack(inp_res, axis=0))
+            test_tar = np.squeeze(np.stack(tar_res, axis=0))
+
+            inp = np.squeeze(inp.cpu().numpy())
+            tar = np.squeeze(tar.cpu().numpy())
+
+            self.assertTrue(compare_arrays("test_distributed_subsampling inp", inp, test_inp))
+            self.assertTrue(compare_arrays("test_distributed_subsampling tar", tar, test_tar))
+
+            if idt > self.num_steps:
+                break
+
+    def _test_dali_temporal_window_across_year_boundary_no_duplicates(self):
+        """
+        DALI path, eval mode on the 2-year training set with n_future > 0.
+
+        Invariants on a full non-shuffled epoch:
+          1) every loaded sample is distinct, and
+          2) the loaded set equals direct HDF5 reads of the indices the
+             loader claims to visit (loader.extsource.indices_select).
+
+        (1) catches the original failure mode: a per-year clamp in
+        GeneralES.__call__ that silently maps indices near a year boundary
+        to the same frame, producing duplicates.  (2) additionally catches
+        a regression where the clamp returned a fixed-but-different frame
+        (no duplicates but every sample wrong) and other indexing slips
+        that uniqueness alone would miss.  The test stats fixture is
+        zero-mean / unit-std (testutils.py:311-315) so zscore is a
+        pass-through and the loader's float32 output equals on-disk bytes.
+        """
+        params = copy.deepcopy(self.params)
+        params.multifiles = False
+        params.valid_autoreg_steps = 3   # n_future=3 in eval mode
+        params.batch_size = 1
+
+        loader, _, _ = get_dataloader(
+            params, params.train_data_path, mode="eval", device=self.device, dali_device=self.dali_device,
+        )
+
+        fingerprints = []
+        for token in loader:
+            inp = token[0]
+            for b in range(inp.shape[0]):
+                fingerprints.append(inp[b].cpu().numpy().tobytes())
+
+        unique = len(set(fingerprints))
+        total  = len(fingerprints)
+        self.assertEqual(
+            unique, total,
+            f"{total - unique} duplicate samples in a non-shuffled DALI epoch "
+            f"(total={total}, unique={unique}).",
+        )
+
+        expected = {
+            self._get_sample(params.train_data_path, int(idx)).tobytes()
+            for idx in loader.extsource.indices_select
+        }
+        self.assertEqual(
+            set(fingerprints), expected,
+            "loaded samples do not match direct HDF5 reads of indices_select",
+        )
+
+    def _test_dali_parallel_workers_full_epoch_coverage(self, num_workers):
+        """
+        DALI path, eval mode, parameterized on num_data_workers.
+
+        num_data_workers is plumbed through to both py_num_workers and the
+        external_source's prefetch_queue_depth (data_loader_dali_2d.py:41,70).
+        Under parallel execution DALI runs a SharedBatchDispatcher in a
+        thread per worker that serialises the callback's returned numpy
+        arrays into shared memory.  If GeneralES.__call__ ever returned a
+        reference to a reused per-worker buffer instead of a fresh copy,
+        the main worker thread would invoke the next sample-fetch before
+        the dispatcher had finished reading the previous buffer, producing
+        either duplicate or torn samples.  GeneralES._reorder_channels
+        sidesteps this by always returning a copy; this test locks that
+        invariant in.
+
+        Baseline: raw HDF5 reads via get_sample(), since the test stats
+        fixture is zero-mean / unit-std (testutils.py:311-315) so the
+        zscore normalisation is a pass-through and the loader's float32
+        output matches the on-disk bytes.  This catches a wider class of
+        bugs than a loader-vs-loader comparison would (e.g. wrong-index
+        reads that would alias themselves).
+
+        For each worker count, a full non-shuffled eval epoch must
+          1) be duplicate-free,
+          2) yield exactly the loader's reported step count,
+          3) yield the same SET of samples as direct HDF5 reads of the
+             indices the loader claims to visit.
+        """
+        params = copy.deepcopy(self.params)
+        params.multifiles = False
+        params.batch_size = 1
+        # cap dataset to keep the multi-config sweep cheap; truncate_old
+        # picks the trailing window, so a small cap still exercises a full
+        # epoch through the parallel ES path
+        params.n_eval_samples = 40
+        params.num_data_workers = num_workers
+
+        loader, _, _ = get_dataloader(
+            params, params.valid_data_path, mode="eval", device=self.device, dali_device=self.dali_device,
+        )
+
+        fps = []
+        for token in loader:
+            inp = token[0]
+            for b in range(inp.shape[0]):
+                fps.append(inp[b].cpu().numpy().tobytes())
+
+        self.assertEqual(
+            len(set(fps)), len(fps),
+            f"{len(fps) - len(set(fps))} duplicates with num_data_workers={num_workers} "
+            f"(total={len(fps)}, unique={len(set(fps))})",
+        )
+        self.assertEqual(len(fps), len(loader))
+
+        # ground truth: read the same indices straight from the HDF5 file
+        expected = {
+            self._get_sample(params.valid_data_path, int(idx)).tobytes()
+            for idx in loader.extsource.indices_select
+        }
+        self.assertEqual(
+            set(fps), expected,
+            f"loader samples at num_data_workers={num_workers} do not match "
+            f"direct HDF5 reads",
+        )
+
+    def _test_dali_multi_epoch_reset_state(self):
+        """
+        DALI path, train mode on the 2-year training set.
+
+        Drives the pipeline through two full back-to-back epochs via
+        auto_reset, then a third epoch after an explicit reset_pipeline().
+        Checks
+          - each epoch fully iterates without raising,
+          - each epoch yields distinct samples (no intra-epoch duplicates),
+          - the two shuffled epochs use different permutations (seed is
+            base_seed + cycle_epoch_idx; if the DALI/ES epoch counter got
+            stuck the two epochs would match).
+        """
+        params = copy.deepcopy(self.params)
+        params.multifiles = False
+        params.batch_size = 1
+        params.n_train_samples = 20          # keep the test fast
+        params.n_future = 0
+
+        loader, _, _ = get_dataloader(
+            params, params.train_data_path, mode="train", device=self.device, dali_device=self.dali_device,
+        )
+
+        def _collect_epoch():
+            fps = []
+            for token in loader:
+                inp = token[0]
+                for b in range(inp.shape[0]):
+                    fps.append(inp[b].cpu().numpy().tobytes())
+            return fps
+
+        # auto_reset handles the first-to-second transition
+        fps_ep0 = _collect_epoch()
+        fps_ep1 = _collect_epoch()
+
+        # explicit reset_pipeline() should also produce a valid epoch
+        loader.reset_pipeline()
+        fps_ep2 = _collect_epoch()
+
+        for ep_idx, fps in enumerate((fps_ep0, fps_ep1, fps_ep2)):
+            with self.subTest(desc=f"epoch {ep_idx} non-empty"):
+                self.assertGreater(len(fps), 0)
+            with self.subTest(desc=f"no intra-epoch duplicates in epoch {ep_idx}"):
+                self.assertEqual(len(fps), len(set(fps)))
+
+        # auto_reset must advance the shuffle seed: two consecutive epochs
+        # cannot produce identical orderings.
+        with self.subTest(desc="auto_reset advances shuffle state"):
+            self.assertNotEqual(fps_ep0, fps_ep1)
+
+
+@parameterized_class(("dali_device",), _dali_devices)
+class TestHDF5DataLoader(DataLoaderBase, unittest.TestCase):
+    """DataLoaderBase exercised against HDF5-backed files.
+
+    Both ``multifiles=True`` (MultifilesDataset) and ``multifiles=False``
+    (DALI) paths are tested.  Additionally tests the MultifilesDataset-specific
+    date/index retrieval API which is not available on the DALI path.
+    """
+
+    @classmethod
+    def setUpClass(cls, path: Optional[str] = "/tmp"):
+        cls.device = torch.device("cpu")
+        cls.tmpdir = tempfile.TemporaryDirectory(dir=path)
+        tmp_path = cls.tmpdir.name
+        cls.train_path, cls.num_train, cls.valid_path, cls.num_valid, cls.stats_path, cls.metadata_path, _ = init_hdf5_dataset(tmp_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmpdir.cleanup()
+
+    def _get_sample(self, path, idx):
+        return get_sample(path, idx)
+
+    # multifiles-parameterized tests: both True (MultifilesDataset) and False (DALI)
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_shapes_and_sample_counts(self, multifiles):
+        self._test_shapes_and_sample_counts(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_content(self, multifiles):
+        self._test_content(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_content_normalization_zscore(self, multifiles):
+        self._test_content_normalization_zscore(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_channel_ordering(self, multifiles):
+        self._test_channel_ordering(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_history(self, multifiles):
+        self._test_history(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_future(self, multifiles):
+        self._test_future(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_autoreg(self, multifiles):
+        self._test_autoreg(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_distributed(self, multifiles):
+        self._test_distributed(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_distributed_subsampling(self, multifiles):
+        self._test_distributed_subsampling(multifiles)
+
+    # DALI-specific mechanics tests — defined here (not in DataLoaderBase) so
+    # @parameterized_class strips them from the unparameterized base class.
+    @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
+    def test_dali_temporal_window_across_year_boundary_no_duplicates(self):
+        self._test_dali_temporal_window_across_year_boundary_no_duplicates()
+
+    @parameterized.expand([(1,), (2,), (4,)], skip_on_empty=False)
+    @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
+    def test_dali_parallel_workers_full_epoch_coverage(self, num_workers):
+        self._test_dali_parallel_workers_full_epoch_coverage(num_workers)
+
+    @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
+    def test_dali_multi_epoch_reset_state(self):
+        self._test_dali_multi_epoch_reset_state()
+
+    # HDF5-only: MultifilesDataset date/index retrieval API
+    def test_date_retrieval(self):
+        self.params.multifiles = True
+        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        dhours = 24
+        time1 = train_loader.dataset.get_time_at_index(10)
+        time1_comp = dt.datetime(year=2017, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc) + dt.timedelta(hours=dhours * 10)
+        self.assertEqual(time1, time1_comp)
+        time2 = train_loader.dataset.get_time_at_index(365)
+        time2_comp = dt.datetime(year=2018, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc)
+        self.assertEqual(time2, time2_comp)
+
+    def test_index_retrieval(self):
+        self.params.multifiles = True
+        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        dhours = 24
+        tstamp = dt.datetime(year=2017, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc) + dt.timedelta(hours=dhours * 10)
+        self.assertEqual(train_loader.dataset.get_index_at_time(tstamp), 10)
+        tstamp = dt.datetime(year=2018, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc)
+        self.assertEqual(train_loader.dataset.get_index_at_time(tstamp), 365)
+
+    # HDF5-only, multifiles-only: reverse_time (backward-in-time) is not implemented on DALI
+    def test_reverse_time(self):
+        self._test_reverse_time()
+
+    # HDF5-only, multifiles-only: regression guards for the two latent fixes (in != out target
+    # reads; dt-strided timestamps). Inert for the prototype (in == out, dt == 1); exercised here
+    # in their biting regime to lock them before a larger configuration can introduce it.
+    def test_content_in_neq_out_channels(self):
+        self._test_content_in_neq_out_channels()
+
+    def test_timestamp_dt_stride(self):
+        self._test_timestamp_dt_stride()
+
+
+@parameterized_class(("dali_device",), _dali_devices)
+@unittest.skipUnless(_have_dali, "nvidia.dali is not installed — zarr tests require DALI")
+class TestZarrDataLoader(DataLoaderBase, unittest.TestCase):
+    """DataLoaderBase exercised against zarr-backed files (makani flat format).
+
+    Both ``multifiles=True`` (MultifilesDataset, now zarr-aware) and
+    ``multifiles=False`` (DALI) paths are tested, mirroring TestHDF5DataLoader.
+    MultifilesDataset-specific date/index retrieval is also exercised.
+
+    ``zarr_format="wb2"`` testing lives in ``TestZarrWB2DataLoader``.
+    """
+
+    @classmethod
+    def setUpClass(cls, path: Optional[str] = "/tmp"):
+        cls.device = torch.device("cpu")
+        cls.tmpdir = tempfile.TemporaryDirectory(dir=path)
+        tmp_path = cls.tmpdir.name
+        cls.train_path, cls.num_train, cls.valid_path, cls.num_valid, cls.stats_path, cls.metadata_path, _ = init_zarr_dataset(tmp_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmpdir.cleanup()
+
+    def _get_sample(self, path, idx):
+        return get_zarr_sample(path, idx)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_shapes_and_sample_counts(self, multifiles):
+        self._test_shapes_and_sample_counts(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_content(self, multifiles):
+        self._test_content(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_content_normalization_zscore(self, multifiles):
+        self._test_content_normalization_zscore(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_channel_ordering(self, multifiles):
+        self._test_channel_ordering(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_history(self, multifiles):
+        self._test_history(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_future(self, multifiles):
+        self._test_future(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_autoreg(self, multifiles):
+        self._test_autoreg(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_distributed(self, multifiles):
+        self._test_distributed(multifiles)
+
+    @parameterized.expand(_multifiles_params, skip_on_empty=False)
+    def test_distributed_subsampling(self, multifiles):
+        self._test_distributed_subsampling(multifiles)
+
+    def test_date_retrieval(self):
+        self.params.multifiles = True
+        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        dhours = 24
+        time1 = train_loader.dataset.get_time_at_index(10)
+        time1_comp = dt.datetime(year=2017, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc) + dt.timedelta(hours=dhours * 10)
+        self.assertEqual(time1, time1_comp)
+        time2 = train_loader.dataset.get_time_at_index(365)
+        time2_comp = dt.datetime(year=2018, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc)
+        self.assertEqual(time2, time2_comp)
+
+    def test_index_retrieval(self):
+        self.params.multifiles = True
+        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        dhours = 24
+        tstamp = dt.datetime(year=2017, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc) + dt.timedelta(hours=dhours * 10)
+        self.assertEqual(train_loader.dataset.get_index_at_time(tstamp), 10)
+        tstamp = dt.datetime(year=2018, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc)
+        self.assertEqual(train_loader.dataset.get_index_at_time(tstamp), 365)
+
+
+@parameterized_class(("dali_device",), _dali_devices)
+@unittest.skipUnless(_have_dali, "nvidia.dali is not installed — zarr WB2 tests require DALI")
+class TestZarrWB2DataLoader(DataLoaderBase, unittest.TestCase):
+    """DataLoaderBase exercised against WB2-layout zarr files, DALI path only.
+
+    The fixture (``init_wb2_zarr_dataset``) creates one zarr array per ERA5
+    variable (surface: ``(time, lat, lon)``, atmospheric: ``(time, level, lat, lon)``)
+    mirroring the real WeatherBench2 store layout.  The ES helper auto-detects
+    the WB2 format because ``dataset_name="fields"`` is absent from the group,
+    then builds the variable→level conversion table from ``params.channel_names``
+    (set to ``CHANNEL_NAMES`` by ``get_default_parameters()``).
+    """
+
+    @classmethod
+    def setUpClass(cls, path: Optional[str] = "/tmp"):
+        cls.device = torch.device("cpu")
+        cls.tmpdir = tempfile.TemporaryDirectory(dir=path)
+        tmp_path = cls.tmpdir.name
+        cls.train_path, cls.num_train, cls.valid_path, cls.num_valid, cls.stats_path, cls.metadata_path, _ = init_wb2_zarr_dataset(tmp_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmpdir.cleanup()
+
+    def _get_sample(self, path, idx):
+        return get_wb2_zarr_sample(path, idx)
+
+    # DALI-only (multifiles=False) — one test per behaviour, no parameterization
+    def test_shapes_and_sample_counts(self):
+        self._test_shapes_and_sample_counts(False)
+
+    def test_content(self):
+        self._test_content(False)
+
+    def test_content_normalization_zscore(self):
+        self._test_content_normalization_zscore(False)
+
+    def test_channel_ordering(self):
+        self._test_channel_ordering(False)
+
+    def test_history(self):
+        self._test_history(False)
+
+    def test_future(self):
+        self._test_future(False)
+
+    def test_autoreg(self):
+        self._test_autoreg(False)
+
+    def test_distributed(self):
+        self._test_distributed(False)
+
+    def test_distributed_subsampling(self):
+        self._test_distributed_subsampling(False)
+
+
+class TestDummyLoader(unittest.TestCase):
+    """Smoke tests for the synthetic DummyLoader. CPU-friendly — no DALI, no HDF5 fixture."""
+
+    def setUp(self):
+        disable_tf32()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = 2
+        self.img_shape = (32, 64)
+        self.in_channels = list(range(5))
+        self.out_channels = list(range(5))
+
+    def _make_loader(self, **overrides):
+        from makani.utils.dataloaders.data_loader_dummy import DummyLoader
+        kwargs = dict(
+            location="/nonexistent",
+            device=self.device,
+            batch_size=self.batch_size,
+            dt=1,
+            dhours=6,
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            img_shape=self.img_shape,
+            n_samples_per_epoch=4,
+        )
+        kwargs.update(overrides)
+        return DummyLoader(**kwargs)
+
+    def test_basic_iteration_shapes_and_dtype(self):
+        loader = self._make_loader()
+        self.assertEqual(len(loader), 4)
+        batches = list(loader)
+        self.assertEqual(len(batches), 4)
+        for inp, tar in batches:
+            self.assertEqual(tuple(inp.shape), (self.batch_size, 1, len(self.in_channels), *self.img_shape))
+            self.assertEqual(tuple(tar.shape), (self.batch_size, 1, len(self.out_channels), *self.img_shape))
+            self.assertEqual(inp.dtype, torch.float32)
+            self.assertEqual(tar.dtype, torch.float32)
+
+    def test_history_and_future_dimensions(self):
+        loader = self._make_loader(n_history=2, n_future=3)
+        inp, tar = next(iter(loader))
+        self.assertEqual(inp.shape[1], 3)   # n_history + 1
+        self.assertEqual(tar.shape[1], 4)   # n_future  + 1
+
+    def test_add_zenith_appends_zenith_tensors(self):
+        loader = self._make_loader(add_zenith=True)
+        batch = next(iter(loader))
+        self.assertEqual(len(batch), 4)     # inp, tar, inp_zen, tar_zen
+        _, _, inp_zen, _ = batch
+        self.assertEqual(tuple(inp_zen.shape), (self.batch_size, 1, 1, *self.img_shape))
+
+    def test_return_timestamp_appends_time_tensors(self):
+        loader = self._make_loader(return_timestamp=True)
+        batch = next(iter(loader))
+        self.assertEqual(len(batch), 4)     # inp, tar, inp_time, tar_time
+        _, _, inp_time, _ = batch
+        self.assertEqual(tuple(inp_time.shape), (self.batch_size, 1))
+        self.assertEqual(inp_time.dtype, torch.float64)
+
+    def test_return_target_false_yields_input_only(self):
+        loader = self._make_loader(return_target=False)
+        batch = next(iter(loader))
+        self.assertEqual(len(batch), 1)     # inp only
+
+    def test_subsampling_factor_reduces_spatial_shape(self):
+        loader = self._make_loader(subsampling_factor=2)
+        inp, _ = next(iter(loader))
+        self.assertEqual(tuple(inp.shape[-2:]), (self.img_shape[0] // 2, self.img_shape[1] // 2))
+
+    def test_normalization_helpers_return_neutral_stats(self):
+        loader = self._make_loader()
+        in_bias, in_scale = loader.get_input_normalization()
+        out_bias, out_scale = loader.get_output_normalization()
+        self.assertEqual(in_bias.shape, (1, len(self.in_channels), 1, 1))
+        self.assertTrue((in_bias == 0).all())
+        self.assertTrue((in_scale == 1).all())
+        self.assertTrue((out_bias == 0).all())
+        self.assertTrue((out_scale == 1).all())
+
+if __name__ == "__main__":
+    unittest.main()
