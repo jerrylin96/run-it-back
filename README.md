@@ -113,6 +113,17 @@ A note on memory: FCN3's decoder DISCO convolution allocates ~13.4 GiB of fp32 p
 (batch × members on one GPU), so a 178 GiB GPU holds 4 folded samples. That sets the training
 layout above and the 4-member-per-task inference; larger ensembles are pooled across seeds.
 
+## Reproducing the paper's figures
+
+The paper's figures (the Hurricane Ian tracks and intensity, the two EOF regressions, the PNW
+free-end-states comparison) are side-by-side comparisons of this emulator's ensembles with the
+companion study's cBottle-video ensembles. They are produced by `scripts/backward_emulator/` in
+[jerrylin96/rewinding-the-extremes](https://github.com/jerrylin96/rewinding-the-extremes), which
+reads this repository's pooled field dumps (step 6 above), censors members with this repository's
+`analysis/ensemble_horizon.py` range detector, and runs that repository's diagnostics on both
+methods. That directory's README documents the data layout, the window alignment (the emulator's
+anchor is the cBottle window end) and the recorded commands.
+
 ## Repository layout
 
 ```
