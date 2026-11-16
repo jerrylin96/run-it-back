@@ -88,17 +88,22 @@ class TestRewindConfigConsistency(unittest.TestCase):
 
     def test_backward_targets_wiring(self):
         """Every run target: backward + multifiles + single-step validation."""
-        for target in ("rewind_fcn3_det_smoke", "rewind_fcn3_ens_smoke", "rewind_fcn3_ens_10yr_backward", "rewind_fcn3_ens_casestudy"):
+        for target in ("rewind_fcn3_det_smoke", "rewind_fcn3_ens_smoke", "rewind_fcn3_ens_10yr_backward", "rewind_fcn3_ens_casestudy", "rewind_fcn3_ens_sandy_casestudy"):
             t = self.fcn3[target]
             self.assertTrue(t["reverse_time"], target)
             self.assertTrue(t["multifiles"], target)
             self.assertEqual(t["valid_autoreg_steps"], 0, target)  # trained single-step
 
-    def test_casestudy_target_is_the_trained_architecture(self):
-        """The evaluation-only case-study target must load the trained checkpoint unchanged."""
-        trained, case = self.fcn3["rewind_fcn3_ens_10yr_backward"], self.fcn3["rewind_fcn3_ens_casestudy"]
-        for k in TestFCN3StaleKeyTrap.ARCH_KEYS + ("nettype", "channel_names", "normalization", "input_noise", "ensemble_size"):
-            self.assertEqual(trained[k], case[k], k)
+    def test_casestudy_targets_are_the_trained_model(self):
+        """Every evaluation-only *_casestudy target must load the trained checkpoint unchanged,
+        so nothing but where the data comes from may differ from the trained target."""
+        trained = self.fcn3["rewind_fcn3_ens_10yr_backward"]
+        cases = [k for k in self.fcn3 if k.endswith("_casestudy")]
+        self.assertEqual(set(cases), {"rewind_fcn3_ens_casestudy", "rewind_fcn3_ens_sandy_casestudy"})
+        for name in cases:
+            case = self.fcn3[name]
+            differ = {k for k in set(trained) | set(case) if trained.get(k) != case.get(k)}
+            self.assertLessEqual(differ, {"train_data_path", "inf_data_path", "valid_data_path"}, name)
 
 
 class TestFCN3StaleKeyTrap(unittest.TestCase):

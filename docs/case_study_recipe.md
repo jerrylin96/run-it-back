@@ -48,6 +48,20 @@ Submit-and-forget on a CPU partition (~20 min and ~0.44 TB per year), writing to
 `$MAKANI_DATA/casestudy`, the directory `rewind_fcn3_ens_casestudy` already points at.
 `data_process/subset_time_range.py` can cut a year down to a few tens of GB around one event.
 
+Superstorm Sandy (2012) needs no conversion: 2012 is a training year, already in
+`$MAKANI_DATA/train`. Give it a folder of its own holding only that file, the folder
+`rewind_fcn3_ens_sandy_casestudy` points at:
+
+```bash
+mkdir -p $MAKANI_DATA/casestudy_sandy
+ln -s $MAKANI_DATA/train/2012.h5 $MAKANI_DATA/casestudy_sandy/2012.h5
+```
+
+Do not put it in `casestudy/`. The loader steps across the files in a folder by global index as if
+they were contiguous in time, so a rollout reaching past the start of the 2021 data would read
+late-2012 frames as truth instead of failing. Note that Sandy falls inside the model's 2009–2018
+training years, so it does not test generalization to an unseen event.
+
 ## A2. Run the case-study rollouts
 
 `config/rewind_fcn3.yaml` ships `rewind_fcn3_ens_casestudy`, architecturally identical to the
@@ -81,6 +95,11 @@ and what does and does not pool across tasks:
 sbatch --array=1-250%32 analysis/backward_rollout_ensemble.sbatch rewind_fcn3_ens_casestudy \
        fcn3_ens_10yr 30 4 2021-06-28T12:00
 ```
+
+The paper's three events, each anchored at its pinned final frame (the end of the 66-hour
+window), are the 2021 Pacific Northwest heat dome (`2021-06-28T12:00`), Hurricane Ian
+(`2022-09-30T18:00`) and Superstorm Sandy (`2012-10-30T00:00`, with
+`rewind_fcn3_ens_sandy_casestudy` as the target). The analysis keeps the first 11 steps (66 h).
 
 The events, windows and analysis regions follow the companion study *Extremes on Rewind*
 (Lin et al. 2026, [arXiv:2608.19008](https://arxiv.org/abs/2608.19008); code and case

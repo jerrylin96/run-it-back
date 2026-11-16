@@ -18,6 +18,7 @@
 #                                  isolates ensemble-integration problems (2 GPUs)
 #   rewind_fcn3_ens_10yr_backward  the trained model: ensemble 8, 2009-2018
 #   rewind_fcn3_ens_casestudy      evaluation-only twin of the trained model for case studies
+#   rewind_fcn3_ens_sandy_casestudy  the same, for Superstorm Sandy (2012), reading its own folder
 #
 # PATHS: every absolute path below sits under /data/makani_era5_fcn3. Set MAKANI_DATA in
 # site.env to the same root (the launchers bind-mount it at the same path inside the
@@ -315,3 +316,17 @@ rewind_fcn3_ens_casestudy:
     batch_size: 4
     inf_data_path:   "/data/makani_era5_fcn3/casestudy"
     valid_data_path: "/data/makani_era5_fcn3/casestudy"
+
+# Superstorm Sandy (2012): the same evaluation-only target, reading a folder that holds only a
+# symlink to train/2012.h5 (docs/case_study_recipe.md, A1). Not added to casestudy/: the loader
+# steps across the files in a folder by global index as if they were contiguous in time
+# (_get_data in data_loader_multifiles.py), so a rollout there reaching past the start of the
+# 2021 data would read late-2012 frames as truth instead of failing. NB 2012 is inside the
+# trained model's 2009-2018 training years.
+rewind_fcn3_ens_sandy_casestudy:
+    <<: *BASE_CONFIG
+    reverse_time: !!bool True
+    ensemble_size: 8
+    batch_size: 4
+    inf_data_path:   "/data/makani_era5_fcn3/casestudy_sandy"
+    valid_data_path: "/data/makani_era5_fcn3/casestudy_sandy"

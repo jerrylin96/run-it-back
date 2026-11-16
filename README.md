@@ -15,7 +15,8 @@ backward map is one-to-many — many plausible pasts fit one present — so the 
 **CRPS ensemble** that samples plausible pasts instead of regressing to their average.
 
 The code here is the state of our development branch at the time of the paper (snapshot of
-2026-08-25), with two later bug fixes carried in (see *Corrections after the snapshot*).
+2026-08-25), with two later bug fixes and the Superstorm Sandy case-study target carried in (see
+*Changes after the snapshot*).
 
 ## What changed relative to upstream makani
 
@@ -62,8 +63,8 @@ The paper calls this model **Rewind-AR**.
 
 ## Companion study
 
-The case studies (the 2021 Pacific Northwest heat dome and Hurricane Ian) and their analysis
-regions follow the companion paper *Extremes on Rewind: Generating 1,000-Member Ensembles
+The case studies (the 2021 Pacific Northwest heat dome, Hurricane Ian and Superstorm Sandy) and
+their analysis regions follow the companion paper *Extremes on Rewind: Generating 1,000-Member Ensembles
 Initialized at a Final Condition* (Lin, Chien, Sakarvadia and Barnes, 2026,
 [arXiv:2608.19008](https://arxiv.org/abs/2608.19008)), which generates ensembles conditioned on
 a final state with cBottle-video. Its code and case definitions are at
@@ -109,7 +110,8 @@ container at the same path). Partition names in the scripts are our cluster's; o
    `sbatch analysis/make_backward_video.sbatch <fields.h5> <channel>` renders an animation.
 6. **Case studies and the 1000-member ensembles.** [docs/case_study_recipe.md](docs/case_study_recipe.md):
    convert the event's year, roll out from the event date with the evaluation-only
-   `rewind_fcn3_ens_casestudy` target, pool 250 seeded array tasks with
+   `rewind_fcn3_ens_casestudy` target (`rewind_fcn3_ens_sandy_casestudy` for Superstorm Sandy),
+   pool 250 seeded array tasks with
    `analysis/backward_rollout_ensemble.sbatch`, then run the horizon diagnostics
    (`analysis/plot_ensemble_horizon.py`, `analysis/plot_spectral_horizon.py`).
 
@@ -132,7 +134,7 @@ anchor is the cBottle window end) and the recorded commands.
 ## Repository layout
 
 ```
-config/rewind_fcn3.yaml          the backward FCN3 targets (smokes, the trained model, the case-study twin)
+config/rewind_fcn3.yaml          the backward FCN3 targets (smokes, the trained model, the case-study twins)
 site.env                         the two site-specific paths every launcher reads
 train_fcn3.sbatch                torchrun DDP training (makani.ensemble / makani.train)
 crun                             run one command in the container on a compute node
@@ -154,7 +156,7 @@ fork adds are `test_dataloader.py::test_reverse_time*`, `test_training_helpers.p
 `test_backward_fields_io.py`, `test_metric_fixes.py`, `test_backward_rollout_metrics.py` and
 `test_fcn3_history.py`.
 
-## Corrections after the snapshot
+## Changes after the snapshot
 
 Two fixes made after the snapshot date are included because they do not change anything the
 paper reports:
@@ -166,6 +168,11 @@ paper reports:
   channels and all RMSEs are unaffected (`tests/test_backward_rollout_metrics.py`).
 - **FCN3 with `n_history >= 2`** raised an IndexError at the first forward
   (`UPSTREAM_ISSUES.md` #12). Inert for every configuration here.
+
+One addition, for the revised paper: `rewind_fcn3_ens_sandy_casestudy`, the Superstorm Sandy
+case-study target. It changes no code; it is the existing case-study target pointed at a folder of
+its own ([docs/case_study_recipe.md](docs/case_study_recipe.md), A1), and
+`tests/test_configs.py` checks that only its data paths differ from the trained model's.
 
 One known limitation is left as is: `analysis/rollout_ci_fcn3.sbatch` scores the checkpoint in
 slot `ckpt_mp0_v0.tar`, which with a checkpoint ring deeper than one is not necessarily the newest
