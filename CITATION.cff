@@ -15,7 +15,7 @@ authors:
     affiliation: "Department of Computing and Data Sciences, Boston University"
 preferred-citation:
   type: conference-paper
-  title: "Run it Back: Autoregression vs. Video Diffusion for End-Conditioned Weather Trajectories"
+  title: "Run it Back: Autoregression vs. Video Diffusion for Final-Conditioned Weather Trajectories"
   authors:
     - family-names: Lin
       given-names: Jerry

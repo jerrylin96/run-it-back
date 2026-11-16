@@ -1,6 +1,6 @@
 # Run It Back: a backward-in-time ensemble weather emulator
 
-Code for **Run it Back: Autoregression vs. Video Diffusion for End-Conditioned Weather Trajectories**
+Code for **Run it Back: Autoregression vs. Video Diffusion for Final-Conditioned Weather Trajectories**
 (Jerry Lin and Elizabeth A. Barnes, Department of Computing and Data Sciences, Boston University),
 accepted as a poster at the NeurIPS 2026 Workshop on Tackling Climate Change with Machine Learning.
 Preprint forthcoming; the link will be added here. <!-- arXiv: add the link + eprint fields in Citation -->
@@ -47,6 +47,8 @@ The fork adds:
 - Fixes to defects inherited from upstream, documented in [UPSTREAM_ISSUES.md](UPSTREAM_ISSUES.md).
 
 ## The model
+
+The paper calls this model **Rewind-AR**.
 
 | | |
 |---|---|
@@ -117,9 +119,10 @@ layout above and the 4-member-per-task inference; larger ensembles are pooled ac
 
 ## Reproducing the paper's figures
 
-The paper's figures (the Hurricane Ian tracks and intensity, the two EOF regressions, the PNW
-free-end-states comparison) are side-by-side comparisons of this emulator's ensembles with the
-companion study's cBottle-video ensembles. They are produced by `scripts/backward_emulator/` in
+The paper's figures (the Hurricane Ian and Superstorm Sandy tracks and intensity, the three EOF
+regressions, the PNW free-end-states comparison and the 500 hPa ageostrophic diagnostics) are
+side-by-side comparisons of this emulator's ensembles with the companion study's cBottle-video
+ensembles. They are produced by `scripts/backward_emulator/` in
 [jerrylin96/rewinding-the-extremes](https://github.com/jerrylin96/rewinding-the-extremes), which
 reads this repository's pooled field dumps (step 6 above), censors members with this repository's
 `analysis/ensemble_horizon.py` range detector, and runs that repository's diagnostics on both
@@ -212,7 +215,7 @@ This paper:
 
 ```bibtex
 @inproceedings{lin2026runitback,
-  title     = {Run it Back: Autoregression vs. Video Diffusion for End-Conditioned Weather Trajectories},
+  title     = {Run it Back: Autoregression vs. Video Diffusion for Final-Conditioned Weather Trajectories},
   author    = {Jerry Lin and Elizabeth A. Barnes},
   booktitle = {NeurIPS 2026 Workshop on Tackling Climate Change with Machine Learning},
   year      = {2026},
