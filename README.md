@@ -68,7 +68,7 @@ Initialized at a Final Condition* (Lin, Chien, Sakarvadia and Barnes, 2026,
 [arXiv:2608.19008](https://arxiv.org/abs/2608.19008)), which generates ensembles conditioned on
 a final state with cBottle-video. Its code and case definitions are at
 [jerrylin96/rewinding-the-extremes](https://github.com/jerrylin96/rewinding-the-extremes)
-(archived at [10.5281/zenodo.22000716](https://doi.org/10.5281/zenodo.22000716)). The horizon
+(archived at [10.5281/zenodo.22000715](https://doi.org/10.5281/zenodo.22000715)). The horizon
 diagnostics here take their per-(case, variable) reduction boxes verbatim from that repository's
 `scripts/_shared/cases/*.yaml`, so the two studies reduce over the same pixels, and report
 geopotential as height in metres by the same convention.
