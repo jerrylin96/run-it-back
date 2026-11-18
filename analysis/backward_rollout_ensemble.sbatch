@@ -160,7 +160,7 @@ echo "  checkpoint : $CKPT_DIR"
 echo "  rollout    : R=$NUM_STEPS steps (-$((NUM_STEPS * 6)) h), E=$ENSEMBLE_SIZE members"
 echo "  anchor     : $ANCHOR_DATE"
 echo "  channels   : $N_CH -> $CHANNELS"
-echo "  port       : $((29500 + SEED % 1000))   (per-task; array tasks share nodes)"
+echo "  port       : $((20000 + ${SLURM_JOB_ID:-0} % 9000))   (20000 + SLURM_JOB_ID % 9000; array tasks share nodes)"
 echo "  outputs    : $OUT_JSON"
 echo "               $SCORES/$FIELDS_FILE"
 # Storage is the thing most likely to bite overnight, so state it before writing any of it.
@@ -199,10 +199,12 @@ print(f'preflight OK: {torch.cuda.get_device_name(0)}')
 # and dies with `TypeError: str expected, not NoneType` when MASTER_ADDR comes back None
 # (those vars only exist under srun). Setting RANK forces the env branch.
 #
-# MASTER_PORT IS PER-TASK, unlike the single-job siblings that hardcode 29500. Up to 32 array
-# tasks run at once on 8-GPU nodes, so several share a node; even a world_size=1 group binds
-# a TCPStore on this port, and identical ports on one node collide.
-MASTER_PORT=$((29500 + SEED % 1000))
+# MASTER_PORT must differ between any two jobs that can share a node: even a world_size=1 group
+# binds a TCPStore on it. Up to 32 array tasks run at once on 8-GPU nodes, and every array task
+# has its own SLURM_JOB_ID, so this gives each job its own port (the single-job launchers use the
+# same formula). The old 29500 + seed collided whenever two jobs of this script ran the same seed
+# on one node.
+MASTER_PORT=$((20000 + ${SLURM_JOB_ID:-0} % 9000))
 apptainer exec --nv \
   --bind "$SLURM_SUBMIT_DIR":/opt/makani \
   --bind "$MAKANI_DATA":"$MAKANI_DATA" \

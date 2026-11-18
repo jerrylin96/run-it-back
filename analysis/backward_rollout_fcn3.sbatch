@@ -144,7 +144,7 @@ print('  PREFLIGHT OK')
 # setting it keeps it off the SLURM branch (which needs srun-launched variables).
 apptainer exec --nv \
   --env RANK=0 --env WORLD_SIZE=1 --env LOCAL_RANK=0 \
-  --env MASTER_ADDR=127.0.0.1 --env MASTER_PORT=29500 \
+  --env MASTER_ADDR=127.0.0.1 --env MASTER_PORT=$((20000 + ${SLURM_JOB_ID:-0} % 9000)) \
   --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --env WANDB_MODE=disabled \
   --bind "$SLURM_SUBMIT_DIR":/opt/makani \

@@ -98,7 +98,7 @@ echo "=== rollout-CI: $CONFIG_TARGET/$RUN_NUM epoch $EPOCH -> $CI_DIR (R=$NUM_ST
 # ---- the snapshot rollout (latest checkpoint, evaluated from the tmpfs copy) --
 apptainer exec --nv \
   --env RANK=0 --env WORLD_SIZE=1 --env LOCAL_RANK=0 \
-  --env MASTER_ADDR=127.0.0.1 --env MASTER_PORT=29500 \
+  --env MASTER_ADDR=127.0.0.1 --env MASTER_PORT=$((20000 + ${SLURM_JOB_ID:-0} % 9000)) \
   --env WANDB_MODE=disabled \
   --bind "$SLURM_SUBMIT_DIR":/opt/makani \
   --bind "$MAKANI_DATA":"$MAKANI_DATA" \

@@ -158,7 +158,7 @@ fork adds are `test_dataloader.py::test_reverse_time*`, `test_training_helpers.p
 
 ## Changes after the snapshot
 
-Two fixes made after the snapshot date are included because they do not change anything the
+Three fixes made after the snapshot date are included because they do not change anything the
 paper reports:
 
 - **Humidity ACC.** `analysis/backward_rollout.py` and `analysis/verify_direction.py` added an
@@ -168,6 +168,11 @@ paper reports:
   channels and all RMSEs are unaffected (`tests/test_backward_rollout_metrics.py`).
 - **FCN3 with `n_history >= 2`** raised an IndexError at the first forward
   (`UPSTREAM_ISSUES.md` #12). Inert for every configuration here.
+- **Launcher port.** `analysis/backward_rollout_fcn3.sbatch`, `analysis/rollout_ci_fcn3.sbatch`
+  and `analysis/backward_rollout_ensemble.sbatch` gave PyTorch's process-group store a fixed port
+  (29500, or 29500 + seed), so a job failed with `EADDRINUSE` whenever another job on the same
+  shared node held that port. Each job now uses `20000 + SLURM_JOB_ID % 9000`. Launch plumbing
+  only; nothing the model computes changes.
 
 One addition, for the revised paper: `rewind_fcn3_ens_sandy_casestudy`, the Superstorm Sandy
 case-study target. It changes no code; it is the existing case-study target pointed at a folder of
