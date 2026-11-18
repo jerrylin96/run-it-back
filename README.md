@@ -61,6 +61,16 @@ The paper calls this model **Rewind-AR**.
 | Data | ERA5 via ARCO; train 2009–2018, validation 2019 |
 | Config | `config/rewind_fcn3.yaml`, target `rewind_fcn3_ens_10yr_backward` |
 
+### Pretrained weights
+
+The checkpoint behind the paper (epoch 14, iteration 51,128), its normalization statistics
+and invariants, and this code at tag `v1.0.0` are archived on Zenodo:
+[doi:10.5281/zenodo.24354437](https://doi.org/10.5281/zenodo.24354437). Check the tar
+against the checksum on the record and unpack it into your data root with
+`tar -xkf rewind-ar_model_v1.0.0.tar -C "$MAKANI_DATA"`. With it you can skip training
+(step 3) and the statistics and invariants in step 2; you still convert the ERA5 years
+you roll out over, and step 5 then runs as written.
+
 ## Companion study
 
 The case studies (the 2021 Pacific Northwest heat dome, Hurricane Ian and Superstorm Sandy) and
