@@ -96,6 +96,10 @@ sbatch --array=1-250%32 analysis/backward_rollout_ensemble.sbatch rewind_fcn3_en
        fcn3_ens_10yr 30 4 2021-06-28T12:00
 ```
 
+Array task *t* rolls out with `--noise_seed` *t* (`SLURM_ARRAY_TASK_ID`), so the paper's 1000
+members per case are tasks 1–250 × 4 members, and each field dump records its seed in its
+attributes. Seeds are fixed, but numerical results can vary across GPU and software environments.
+
 The paper's three events, each anchored at its pinned final frame (the end of the 66-hour
 window), are the 2021 Pacific Northwest heat dome (`2021-06-28T12:00`), Hurricane Ian
 (`2022-09-30T18:00`) and Superstorm Sandy (`2012-10-30T00:00`, with
