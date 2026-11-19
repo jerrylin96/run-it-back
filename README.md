@@ -3,7 +3,7 @@
 Code for **Run it Back: Autoregression vs. Video Diffusion for Final-Conditioned Weather Trajectories**
 (Jerry Lin and Elizabeth A. Barnes, Department of Computing and Data Sciences, Boston University),
 accepted as a poster at the NeurIPS 2026 Workshop on Tackling Climate Change with Machine Learning.
-Preprint forthcoming; the link will be added here. <!-- arXiv: add the link + eprint fields in Citation -->
+Preprint: [arXiv:2611.21521](https://arxiv.org/abs/2611.21521).
 
 [![tests](https://github.com/jerrylin96/run-it-back/actions/workflows/tests.yml/badge.svg)](https://github.com/jerrylin96/run-it-back/actions/workflows/tests.yml)
 
@@ -242,6 +242,9 @@ This paper:
   booktitle = {NeurIPS 2026 Workshop on Tackling Climate Change with Machine Learning},
   year      = {2026},
   note      = {Poster},
+  eprint    = {2611.21521},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2611.21521},
 }
 ```
 
